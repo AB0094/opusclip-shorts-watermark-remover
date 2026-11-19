@@ -24,7 +24,7 @@
  * MediaRecorder/WebM remains as a fallback for browsers without VideoEncoder.
  */
 
-import { drawMask, badgeRect, verticalBadgeRect, WATERMARK_START, WATERMARK_MORPH_START, INTRO_END_SECONDS } from './geometry.js';
+import { drawMask, badgeRect, verticalBadgeRect, watermarkRect, WATERMARK_START, WATERMARK_MORPH_START, INTRO_END_SECONDS } from './geometry.js';
 import * as inpainter from './inpainter.js';
 
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/build/mp4-muxer.mjs';
