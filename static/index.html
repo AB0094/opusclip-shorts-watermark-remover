@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpusClip Shorts Watermark Remover</title>
+<meta name="description" content="Remove the OpusClip watermark from vertical shorts. Runs entirely in your browser — the video never leaves your machine." />
+<meta name="theme-color" content="#0b0d12" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230b0d12'/><circle cx='50' cy='44' r='15' fill='none' stroke='%237c5cff' stroke-width='9'/><path d='M38 56v30' stroke='%237c5cff' stroke-width='9' stroke-linecap='round'/></svg>" />
+<link rel="stylesheet" href="css/app.css" />
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js" crossorigin="anonymous" defer></script>
+</head>
+<body>
+<div class="ambient" aria-hidden="true"></div>
+
+<header class="site-head">
+  <a class="brand" href="./">
+    <svg viewBox="0 0 40 40" aria-hidden="true" class="brand-mark">
+      <circle cx="20" cy="17" r="7" fill="none" stroke="currentColor" stroke-width="4.4" />
+      <path d="M14 23v12" stroke="currentColor" stroke-width="4.4" stroke-linecap="round" />
+    </svg>
+    <span>OpusClip <strong>Watermark Remover</strong></span>
+  </a>
+  <div class="head-right">
+    <span id="backend-pill" class="pill" title="Inference backend">model idle</span>
+    <a class="ghost-link" href="https://github.com/QuintessenLabs/opusclip-shorts-watermark-remover" target="_blank" rel="noreferrer">GitHub</a>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>Strip the badge from your shorts</h1>
+    <p class="lede">
+      The OpusClip badge always lands in the same corner. This finds that corner,
+      inpaints it per frame with MI-GAN, and gives you the clip back —
+      <strong>on your machine</strong>. No upload, no account, no queue.
+    </p>
+    <ul class="ticks">
+      <li>Fixed badge geometry, scaled to any 9:16 export</li>
+      <li>WebGPU, with WASM fallback</li>
+      <li>Audio preserved, MP4 out</li>
+    </ul>
+  </section>
+
+  <section id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Choose a video or image">
+    <div class="dz-inner">
+      <svg viewBox="0 0 24 24" class="dz-icon" aria-hidden="true">
+        <path d="M12 16V4m0 0L7 9m5-5 5 5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"
+              fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <p class="dz-title">Drop a short here</p>
+      <p class="dz-sub">MP4 / MOV / WEBM, or a PNG / JPG still — everything stays local</p>
+      <button class="btn btn-primary" id="pick">Choose file</button>
+      <input id="file" type="file" accept="video/*,image/*" hidden />
+    </div>
+  </section>
+
+  <section id="studio" class="studio" hidden>
+    <div class="stage">
+      <div class="stage-head">
+        <div class="file-meta">
+          <strong id="file-name">—</strong>
+          <span id="file-info" class="muted">—</span>
+        </div>
+        <div class="stage-actions">
+          <label class="switch">
+            <input type="checkbox" id="show-mask" />
+            <span>Show mask</span>
+          </label>
+          <button class="btn btn-ghost" id="reset">New file</button>
+        </div>
+      </div>
+
+      <div class="canvas-wrap" id="canvas-wrap">
+        <canvas id="preview"></canvas>
+        <div class="badge-outline" id="badge-outline" hidden></div>
+      </div>
+
+      <div class="detect" id="detect-line">
+        <span class="dot" id="detect-dot"></span>
+        <span id="detect-text">Read the first frame to check for the badge…</span>
+      </div>
+    </div>
+
+    <aside class="controls">
+      <h2>Run</h2>
+
+      <div class="control-block">
+        <label class="switch">
+          <input type="checkbox" id="temporal" checked />
+          <span>Temporal smoothing <em>reduces shimmer on hair</em></span>
+        </label>
+        <label class="switch">
+          <input type="checkbox" id="refine" />
+          <span>Refine pass <em>slower, sharper</em></span>
+        </label>
+      </div>
+
+      <div class="progress" id="progress-wrap" hidden>
+        <div class="bar"><span id="bar"></span></div>
+        <p class="muted" id="progress-text">Preparing…</p>
+      </div>
+
+      <button class="btn btn-primary btn-wide" id="run">Remove watermark</button>
+      <button class="btn btn-ghost btn-wide" id="cancel" hidden>Cancel</button>
+      <a class="btn btn-download btn-wide" id="download" hidden download>Download result</a>
+
+      <p class="note" id="status" role="status"></p>
+
+      <details class="fineprint">
+        <summary>What this can and cannot do</summary>
+        <p>
+          The badge is fully opaque, so the pixels underneath it are gone — this
+          <em>reconstructs</em> that patch, it does not recover the original. Over
+          flat walls and shadows it is invisible; over fine hair or text it can
+          soften. The mask is a fixed top-left box: 355×85 px at 1080×1920, plus
+          the taller intro state for the first ~8.5 s.
+        </p>
+      </details>
+    </aside>
+  </section>
+</main>
+
+<footer>
+  <p>
+    Open source, MIT. Model: <a href="https://github.com/Picsart-AI-Research/MI-GAN" target="_blank" rel="noreferrer">MI-GAN</a>
+    (Picsart Research, ICCV 2023) via ONNX Runtime Web.
+  </p>
+</footer>
+
+<script src="js/coi-bootstrap.js"></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

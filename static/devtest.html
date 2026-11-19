@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>dev harness — opusclip remover</title>
+<link rel="icon" href="data:," />
+<style>
+  body { background:#0b0d12; color:#e8eaf1; font:13px/1.5 ui-monospace, monospace; padding:20px; }
+  h1 { font:600 16px system-ui; }
+  pre { background:#12141b; padding:12px; border-radius:8px; white-space:pre-wrap; }
+  canvas { max-width:520px; border-radius:8px; margin:6px 6px 0 0; }
+  .ok { color:#4be3a4; } .bad { color:#ff6b81; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js" crossorigin="anonymous"></script>
+</head>
+<body>
+<h1>dev harness</h1>
+<p>Runs the real modules against synthetic + sample media. Results land in <code>window.__dev</code>.</p>
+<pre id="log">booting…</pre>
+<div id="shots"></div>
+
+<script type="module">
+import * as inpainter from './js/inpainter.js';
+import * as video from './js/video.js';
+import { drawMask, badgeRect } from './js/geometry.js';
+
+const logEl = document.getElementById('log');
+const results = { steps: [], ok: true };
+window.__dev = results;
+
+function log(msg, ok) {
+  results.steps.push({ msg, ok });
+  if (ok === false) results.ok = false;
+  logEl.textContent += `\n${ok === false ? '✗' : ok === true ? '✓' : '·'} ${msg}`;
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log('[dev]', msg);
+}
+
+window.addEventListener('error', (e) => log(`window error: ${e.message}`, false));
+window.addEventListener('unhandledrejection', (e) => log(`unhandled rejection: ${e.reason}`, false));
+
+log(`crossOriginIsolated = ${window.crossOriginIsolated}`);
+log(`hardwareConcurrency = ${navigator.hardwareConcurrency}`);
+try {
+  const ad = await navigator.gpu?.requestAdapter();
+  log(`gpu adapter = ${ad ? `${ad.info?.vendor || '?'} / ${ad.info?.architecture || '?'} / ${ad.info?.description || ''}` : 'none'}`);
+} catch (e) { log(`gpu adapter probe failed: ${e.message}`); }
+
+try {
+  await inpainter.init((p) => { if (p.stage) log(p.stage); });
+  log(`model ready, backend = ${inpainter.getBackend()}`, true);
+} catch (e) {
+  log(`model init failed: ${e.message}`, false);
+  window.__dev.done = true;
+  throw e;
+}
+
+/* ---------- 1. synthetic image ---------- */
+try {
+  const W = 640, H = 360;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+
+  // textured background so the fill has something to reconstruct
+  ctx.fillStyle = '#3a4a63';
+  ctx.fillRect(0, 0, W, H);
+  for (let i = 0; i < 900; i++) {
+    ctx.fillStyle = `hsla(${(i * 37) % 360}, 40%, ${20 + (i % 40)}%, 0.5)`;
+    ctx.fillRect(Math.random() * W, Math.random() * H, 12, 12);
+  }
+  // fake badge in the top-left, same relative anchor
+  const b = badgeRect(W);
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.fillStyle = '#111';
+  ctx.font = '600 22px system-ui';
+  ctx.fillText('OpusClip', b.x + 70, b.y + 46);
+
+  const before = ctx.getImageData(0, 0, W, H);
+
+  const mc = document.createElement('canvas');
+  mc.width = W; mc.height = H;
+  const mctx = mc.getContext('2d', { willReadFrequently: true });
+  drawMask(mctx, W, H, { includeIntro: false });
+  const mask = mctx.getImageData(0, 0, W, H);
+
+  const times = [];
+  let after;
+  for (let k = 0; k < 3; k++) {
+    const t0 = performance.now();
+    after = await inpainter.inpaint(before, mask, { passes: 1 });
+    times.push(Math.round(performance.now() - t0));
+  }
+  const ms = times[times.length - 1];
+
+  ctx.putImageData(after, 0, 0);
+  document.getElementById('shots').appendChild(c);
+
+  let inMaskChanged = 0, inMaskCount = 0, ringBlips = 0, farVisible = 0, maxFar = 0;
+  const near = 8;   // the compositor feathers the mask edge by ~5 px on purpose
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      const a = mask.data[i * 4 + 3];
+      const dr = Math.abs(before.data[i * 4] - after.data[i * 4]);
+      const dg = Math.abs(before.data[i * 4 + 1] - after.data[i * 4 + 1]);
+      const db = Math.abs(before.data[i * 4 + 2] - after.data[i * 4 + 2]);
+      const d = dr + dg + db;
+      if (a > 64) { inMaskCount++; if (d > 8) inMaskChanged++; continue; }
+      if (d === 0) continue;
+      let touches = false;
+      for (let dy = -near; dy <= near && !touches; dy++) {
+        for (let dx = -near; dx <= near; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+          if (mask.data[(ny * W + nx) * 4 + 3] > 64) { touches = true; break; }
+        }
+      }
+      if (touches) { ringBlips++; continue; }
+      const maxc = Math.max(dr, dg, db);
+      if (maxc > maxFar) maxFar = maxc;
+      if (maxc >= 4) farVisible++;
+    }
+  }
+  log(`image inpaint ${times.join(' / ')} ms (cold → warm): ${inMaskChanged}/${inMaskCount} masked px changed`, inMaskChanged > inMaskCount * 0.9);
+  log(`visible damage beyond the feather ring: ${farVisible} px (max delta ${maxFar}/255; ${ringBlips} ring blends)`, farVisible === 0);
+
+  // is the white badge actually gone?
+  let whiteLeft = 0;
+  for (let y = b.y; y < b.y + b.h; y++) {
+    for (let x = b.x; x < b.x + b.w; x++) {
+      const i = (y * W + x) * 4;
+      if (after.data[i] > 240 && after.data[i + 1] > 240 && after.data[i + 2] > 240) whiteLeft++;
+    }
+  }
+  log(`white pixels left inside badge box: ${whiteLeft} of ${b.w * b.h}`, whiteLeft < b.w * b.h * 0.02);
+  results.image = { ms, whiteLeft, farVisible, maxFar };
+} catch (e) {
+  log(`image test failed: ${e.message}`, false);
+}
+
+/* ---------- 2. real video through the full pipeline ---------- */
+try {
+  const res = await fetch('sample/sample.mp4');
+  if (!res.ok) throw new Error(`sample.mp4 missing (HTTP ${res.status})`);
+  const blob = await res.blob();
+  const file = new File([blob], 'sample.mp4', { type: 'video/mp4' });
+
+  const canvas = document.createElement('canvas');
+  canvas.style.maxWidth = '260px';
+  document.getElementById('shots').appendChild(canvas);
+
+  const t0 = performance.now();
+  const out = await video.processVideo({
+    file,
+    canvas,
+    intro: false,          // the sample is a mid-clip excerpt: badge already settled
+    temporal: true,
+    passes: 1,
+    onProgress: ({ value }) => { if (Math.round(value * 100) % 20 === 0) log(`video ${Math.round(value * 100)}%`); },
+  });
+  const secs = ((performance.now() - t0) / 1000).toFixed(1);
+
+  log(`video: ${(out.blob.size / 1048576).toFixed(2)} MB, ${out.mimeType}, ${out.frames} frames, ${out.patches} patches, ${secs}s`, out.blob.size > 10000);
+  results.video = { size: out.blob.size, mimeType: out.mimeType, frames: out.frames, patches: out.patches, secs };
+
+  // the canvas holds the last presented frame: is the badge area clean?
+  const vc = canvas.getContext('2d', { willReadFrequently: true });
+  const vr = badgeRect(canvas.width);
+  const vd = vc.getImageData(vr.x, vr.y, vr.w, vr.h).data;
+  let vWhite = 0;
+  for (let i = 0; i < vd.length; i += 4) {
+    if (vd[i] > 235 && vd[i + 1] > 235 && vd[i + 2] > 235) vWhite++;
+  }
+  log(`white left in badge box of the exported frame: ${vWhite}/${vr.w * vr.h}`, vWhite < vr.w * vr.h * 0.05);
+
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(out.blob);
+  a.download = 'sample-clean' + (/mp4/.test(out.mimeType) ? '.mp4' : '.webm');
+  a.textContent = `⬇ download ${a.download}`;
+  a.style.color = '#9ae6c8';
+  document.getElementById('shots').appendChild(document.createElement('br'));
+  document.getElementById('shots').appendChild(a);
+} catch (e) {
+  if (/missing/.test(e.message)) log('video test skipped — no sample/sample.mp4 in the checkout');
+  else log(`video test failed: ${e.message}`, false);
+}
+
+log(results.ok ? 'ALL CHECKS PASSED' : 'SOME CHECKS FAILED', results.ok);
+window.__dev.done = true;
+</script>
+</body>
+</html>

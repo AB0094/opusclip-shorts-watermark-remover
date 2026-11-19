@@ -1,0 +1,12 @@
+{
+  "name": "opusclip-shorts-watermark-remover",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Removes the OpusClip corner badge from vertical shorts, entirely in the browser.",
+  "type": "module",
+  "scripts": {
+    "test": "node tools/test-math.mjs",
+    "serve": "node tools/serve.mjs"
+  },
+  "license": "MIT"
+}
