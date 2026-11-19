@@ -1,36 +1,33 @@
 /**
- * OpusClip badge geometry.
+ * OpusClip badge & animated intro geometry.
  *
- * The OpusClip watermark is not placed by a model — it is a fixed overlay,
- * composited by OpusClip's renderer at a fixed anchor. Measured from real
- * 1080x1920 exports:
+ * Measured across consensus frames of independent exports:
+ *   settled horizontal badge: x=124 y=254 w=353 h=84
+ *   animated vertical badge:   x=124 y=272 w=82  h=377  ("Created with" + P mark)
  *
- *   settled badge   x=123 y=254 w=355 h=85
- *   intro animation x=124 y=254 w=86  h=456   ("Created with" + P mark, vertical)
- *
- * The intro state is the same logo rotated 90° and parked at the same corner;
- * it plays for roughly the first 8 seconds, then settles into the horizontal
- * badge. Both states share the top-left anchor, so one scaled mask covers every
- * export we have measured.
- *
- * All coordinates are in a 1080x1920 reference frame and scale linearly with
- * frame width. (Width, not height, because the badge anchor is horizontal.)
+ * Animation timeline:
+ *   t < 4.75s:          NO watermark (clean video)
+ *   4.75s <= t < 7.10s: VERTICAL watermark only
+ *   7.10s <= t < 7.90s: Morph / rotation into horizontal position
+ *   t >= 7.90s:         HORIZONTAL watermark only
  */
 
 export const REFERENCE_WIDTH = 1080;
 
-export const BADGE = { x: 123, y: 254, w: 355, h: 85 };
-export const INTRO = { x: 124, y: 254, w: 86, h: 456 };
+export const BADGE_HORIZONTAL = { x: 124, y: 254, w: 353, h: 84 };
+export const BADGE_VERTICAL   = { x: 124, y: 272, w: 82,  h: 377 };
 
-/** Seconds the intro animation is assumed to run. Measured 7.65-8.0s. */
-export const INTRO_END_SECONDS = 8.5;
+// Legacy aliases
+export const BADGE = { x: 124, y: 254, w: 353, h: 84 };
+export const INTRO = { x: 124, y: 272, w: 82,  h: 377 };
 
-/**
- * Scale a reference-frame rect to a real frame.
- * @param {{x:number,y:number,w:number,h:number}} rect
- * @param {number} frameWidth
- */
+export const WATERMARK_START       = 4.75;
+export const WATERMARK_MORPH_START = 7.10;
+export const WATERMARK_SETTLE      = 7.90;
+export const INTRO_END_SECONDS     = 7.90;
+
 export function scaleRect(rect, frameWidth) {
+  if (!rect) return null;
   const s = frameWidth / REFERENCE_WIDTH;
   return {
     x: Math.round(rect.x * s),
@@ -40,87 +37,83 @@ export function scaleRect(rect, frameWidth) {
   };
 }
 
-/**
- * The badge rectangle for a given frame size. Unlike the intro, this is on
- * screen for the whole clip, so it is always masked.
- */
 export function badgeRect(frameWidth) {
-  return scaleRect(BADGE, frameWidth);
+  return scaleRect(BADGE_HORIZONTAL, frameWidth);
 }
 
-/**
- * The intro rectangle, or null when the clip is past the intro.
- * @param {number} frameWidth
- * @param {number} timeSeconds
- */
-export function introRect(frameWidth, timeSeconds) {
-  if (timeSeconds >= INTRO_END_SECONDS) return null;
-  return scaleRect(INTRO, frameWidth);
+export function verticalBadgeRect(frameWidth) {
+  return scaleRect(BADGE_VERTICAL, frameWidth);
 }
 
-/**
- * Draw the removal mask for one frame into a 2D context.
- *
- * We deliberately use solid rectangles rather than tracing the glyph outlines:
- * the overlay is opaque, so anything inside its bounding box is unrecoverable
- * anyway, and a rectangle guarantees no anti-aliased fringe survives. The mask
- * is drawn white on transparent; the inpainter reads alpha.
- *
- * @param {CanvasRenderingContext2D} ctx
- * @param {number} width
- * @param {number} height
- * @param {{time?:number, includeIntro?:boolean, pad?:number}} opts
- */
+export function introRect(frameWidth, timeSeconds = 0) {
+  if (timeSeconds >= WATERMARK_SETTLE) return null;
+  return scaleRect(BADGE_VERTICAL, frameWidth);
+}
+
+export function watermarkRect(frameWidth, timeSeconds = 999) {
+  if (timeSeconds < WATERMARK_START) {
+    return null;
+  }
+  if (timeSeconds < WATERMARK_MORPH_START) {
+    return scaleRect(BADGE_VERTICAL, frameWidth);
+  }
+  if (timeSeconds < WATERMARK_SETTLE) {
+    const p = (timeSeconds - WATERMARK_MORPH_START) / (WATERMARK_SETTLE - WATERMARK_MORPH_START);
+    const rect = {
+      x: 124,
+      y: Math.round(272 - 18 * p),
+      w: Math.round(82 + 271 * p),
+      h: Math.round(377 - 293 * p),
+    };
+    return scaleRect(rect, frameWidth);
+  }
+  return scaleRect(BADGE_HORIZONTAL, frameWidth);
+}
+
 export function drawMask(ctx, width, height, opts = {}) {
-  // The pad is deliberate: the patch that gets composited back is feathered at
-  // its border, and the ramp must fall entirely outside the glyph box so no
-  // anti-aliased watermark edge survives.
-  const { time = 0, includeIntro = true, pad = 5 } = opts;
+  const { time = 999, pad = 5, mode = 'auto' } = opts;
   ctx.clearRect(0, 0, width, height);
   ctx.fillStyle = '#fff';
 
-  const rects = [badgeRect(width)];
-  if (includeIntro) {
-    const intro = introRect(width, time);
-    if (intro) rects.push(intro);
+  let rect = null;
+  if (mode === 'horizontal') {
+    rect = badgeRect(width);
+  } else if (mode === 'vertical') {
+    rect = verticalBadgeRect(width);
+  } else if (opts.includeIntro === false) {
+    rect = badgeRect(width);
+  } else if (opts.includeIntro === true) {
+    rect = verticalBadgeRect(width) || badgeRect(width);
+  } else {
+    rect = watermarkRect(width, time);
   }
 
-  for (const r of rects) {
-    ctx.fillRect(r.x - pad, r.y - pad, r.w + pad * 2, r.h + pad * 2);
+  if (rect) {
+    ctx.fillRect(
+      Math.max(0, rect.x - pad),
+      Math.max(0, rect.y - pad),
+      Math.min(width - (rect.x - pad), rect.w + pad * 2),
+      Math.min(height - (rect.y - pad), rect.h + pad * 2)
+    );
   }
 }
 
-/**
- * How much of the badge box is actually covered by near-white pixels.
- *
- * Used to sanity-check that a clip really carries the OpusClip badge before we
- * spend a minute inpainting a region that has nothing in it. Not a detector in
- * the general sense — the position is known, this only confirms presence.
- *
- * @param {Uint8ClampedArray} rgba  full-frame RGBA
- * @param {number} width
- * @param {number} height
- * @param {number} time
- * @returns {number} 0..1 coverage of the badge box
- */
 export function badgeCoverage(rgba, width, height, time = 999) {
-  const rects = [badgeRect(width)];
-  const intro = introRect(width, time);
-  if (intro) rects.push(intro);
+  const rect = (time >= WATERMARK_START && time < WATERMARK_MORPH_START)
+    ? verticalBadgeRect(width)
+    : badgeRect(width);
 
+  if (!rect) return 0;
   let hit = 0;
   let total = 0;
-  for (const r of rects) {
-    for (let y = r.y; y < Math.min(r.y + r.h, height); y++) {
-      for (let x = r.x; x < Math.min(r.x + r.w, width); x++) {
-        const i = (y * width + x) * 4;
-        const r0 = rgba[i], g0 = rgba[i + 1], b0 = rgba[i + 2];
-        // near-white: bright and desaturated
-        const max = Math.max(r0, g0, b0);
-        const min = Math.min(r0, g0, b0);
-        if (max > 225 && max - min < 45) hit++;
-        total++;
-      }
+  for (let y = rect.y; y < Math.min(rect.y + rect.h, height); y++) {
+    for (let x = rect.x; x < Math.min(rect.x + rect.w, width); x++) {
+      const i = (y * width + x) * 4;
+      const r0 = rgba[i], g0 = rgba[i + 1], b0 = rgba[i + 2];
+      const max = Math.max(r0, g0, b0);
+      const min = Math.min(r0, g0, b0);
+      if (max > 220 && max - min < 50) hit++;
+      total++;
     }
   }
   return total ? hit / total : 0;

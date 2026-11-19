@@ -24,7 +24,7 @@
  * MediaRecorder/WebM remains as a fallback for browsers without VideoEncoder.
  */
 
-import { drawMask, badgeRect, INTRO_END_SECONDS } from './geometry.js';
+import { drawMask, badgeRect, verticalBadgeRect, WATERMARK_START, WATERMARK_MORPH_START, INTRO_END_SECONDS } from './geometry.js';
 import * as inpainter from './inpainter.js';
 
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/build/mp4-muxer.mjs';
@@ -97,33 +97,50 @@ export async function processVideo(o) {
   outCtx.fillStyle = '#000';
   outCtx.fillRect(0, 0, width, height);
 
-  // ---- fixed mask geometry, scaled to this video ----
-  const maskCanvas = makeCanvas(width, height);
-  const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true });
+  // ---- 1. Horizontal settled badge runner ----
+  const maskHorizCanvas = makeCanvas(width, height);
+  const maskHorizCtx = maskHorizCanvas.getContext('2d', { willReadFrequently: true });
+  drawMask(maskHorizCtx, width, height, { mode: 'horizontal' });
+  const maskHorizPixels = maskHorizCtx.getImageData(0, 0, width, height);
 
-  maskCtx.clearRect(0, 0, width, height);
-  drawMask(maskCtx, width, height, { includeIntro: false });
-  const basePixels = maskCtx.getImageData(0, 0, width, height);
+  const planHoriz = inpainter.createPlan(maskHorizPixels, { context: 1.15 });
+  if (!planHoriz) throw new Error('Horizontal mask is empty.');
+  const cropHoriz = { x: planHoriz.x, y: planHoriz.y, size: planHoriz.size };
+  const cropMaskHoriz = maskCrop(maskHorizPixels, cropHoriz, 'badge');
+  const runnerHoriz = inpainter.createCropRunner(cropMaskHoriz, planHoriz.size);
+  const cropCanvasHoriz = makeCanvas(planHoriz.size, planHoriz.size);
+  const cropCtxHoriz = cropCanvasHoriz.getContext('2d', { willReadFrequently: true });
 
-  let introPixels = basePixels;
+  // ---- 2. Vertical animated intro runner (only inpaint the slim vertical strip!) ----
+  let planVert = null;
+  let cropVert = null;
+  let runnerVert = null;
+  let cropCanvasVert = null;
+  let cropCtxVert = null;
+
   if (hasIntro) {
-    maskCtx.clearRect(0, 0, width, height);
-    drawMask(maskCtx, width, height, { includeIntro: true });
-    introPixels = maskCtx.getImageData(0, 0, width, height);
+    const maskVertCanvas = makeCanvas(width, height);
+    const maskVertCtx = maskVertCanvas.getContext('2d', { willReadFrequently: true });
+    drawMask(maskVertCtx, width, height, { mode: 'vertical' });
+    const maskVertPixels = maskVertCtx.getImageData(0, 0, width, height);
+
+    planVert = inpainter.createPlan(maskVertPixels, { context: 1.15 });
+    if (planVert) {
+      cropVert = { x: planVert.x, y: planVert.y, size: planVert.size };
+      const cropMaskVert = maskCrop(maskVertPixels, cropVert, 'intro');
+      runnerVert = inpainter.createCropRunner(cropMaskVert, planVert.size);
+      cropCanvasVert = makeCanvas(planVert.size, planVert.size);
+      cropCtxVert = cropCanvasVert.getContext('2d', { willReadFrequently: true });
+    }
   }
 
-  const plan = inpainter.createPlan(hasIntro ? introPixels : basePixels, { context: 1.15 });
-  if (!plan) throw new Error('Mask is empty — nothing to remove.');
-  const crop = { x: plan.x, y: plan.y, size: plan.size };
-
-  const cropMaskBase = maskCrop(basePixels, crop, 'badge');
-  const cropMaskIntro = hasIntro ? maskCrop(introPixels, crop, 'intro') : cropMaskBase;
-  const runnerBase = inpainter.createCropRunner(cropMaskBase, plan.size);
-  const runnerIntro = hasIntro ? inpainter.createCropRunner(cropMaskIntro, plan.size) : runnerBase;
-  if (!runnerBase) throw new Error('Mask is empty — nothing to remove.');
-
-  const cropCanvas = makeCanvas(plan.size, plan.size);
-  const cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
+  // Active watermark state across time
+  const getActiveState = () => {
+    const t = video.currentTime;
+    if (hasIntro && t < WATERMARK_START) return 'none';
+    if (hasIntro && t < WATERMARK_MORPH_START) return 'vertical';
+    return 'horizontal';
+  };
 
   // ---- patch state shared by both export paths ----
   let patches = 0;
@@ -133,13 +150,19 @@ export async function processVideo(o) {
   let lastRunner = null;
   const ring = [];
 
-  const currentRunner = () =>
-    hasIntro && video.currentTime < INTRO_END_SECONDS ? runnerIntro : runnerBase;
-
   async function repaint() {
     if (busy || signal?.aborted) return;
+    const state = getActiveState();
+    if (state === 'none') {
+      lastPatch = null;
+      return;
+    }
     busy = true;
-    const runner = currentRunner();
+    const isVert = state === 'vertical';
+    const runner = (isVert && runnerVert) ? runnerVert : runnerHoriz;
+    const crop = (isVert && cropVert) ? cropVert : cropHoriz;
+    const cropCtx = (isVert && cropCtxVert) ? cropCtxVert : cropCtxHoriz;
+
     try {
       cropCtx.drawImage(video, crop.x, crop.y, crop.size, crop.size, 0, 0, crop.size, crop.size);
       const frame = cropCtx.getImageData(0, 0, crop.size, crop.size);
@@ -155,14 +178,15 @@ export async function processVideo(o) {
         ring.push(filled);
         if (ring.length > 3) ring.shift();
         if (ring.length === 3) {
-          // Only smooth when the patch is nearly still; otherwise the median
-          // lags a moving face by a full patch interval.
           const motion = inpainter.patchMotion(ring[1], ring[2], runner.bbox);
           if (motion < 4) result = inpainter.temporalMedian(ring, runner.mask, runner.bbox);
         }
       }
       lastPatch = inpainter.extractPatch(result, runner.bbox, crop);
-      if (lastPatch) paintPatch(lastPatch);
+      if (lastPatch) {
+        lastPatch.state = state;
+        paintPatch(lastPatch);
+      }
       patches++;
     } catch (err) {
       console.error('[video] repaint failed:', err);
@@ -206,15 +230,19 @@ export async function processVideo(o) {
 
   function present() {
     outCtx.drawImage(video, 0, 0, width, height);
-    if (lastPatch) outCtx.drawImage(patchCanvas, lastPatch.x, lastPatch.y);
+    const state = getActiveState();
+    if (state !== 'none' && lastPatch && lastPatch.state === state) {
+      outCtx.drawImage(patchCanvas, lastPatch.x, lastPatch.y);
+    }
     frames++;
   }
 
-  // Prime the patch before the first encoded frame so the export never opens
-  // on a badge.
-  video.currentTime = 0.02;
-  await new Promise((r) => { video.onseeked = r; });
-  await repaint();
+  // Prime horizontal badge patch if needed
+  if (!hasIntro) {
+    video.currentTime = 0.02;
+    await new Promise((r) => { video.onseeked = r; });
+    await repaint();
+  }
 
   const muxerMod = await import(MUXER_URL).catch((e) => {
     console.warn('[video] mp4-muxer unavailable, falling back to MediaRecorder:', e?.message);

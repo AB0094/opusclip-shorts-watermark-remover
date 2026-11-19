@@ -28,12 +28,12 @@ const test = (name, fn) => {
 console.log('\ngeometry');
 
 test('badge geometry is the measured one at 1080x1920', () => {
-  assert.deepEqual(badgeRect(1080), { x: 123, y: 254, w: 355, h: 85 });
+  assert.deepEqual(badgeRect(1080), { x: 124, y: 254, w: 353, h: 84 });
 });
 
 test('badge scales with width', () => {
-  assert.deepEqual(badgeRect(720), { x: 82, y: 169, w: 237, h: 57 });
-  assert.deepEqual(badgeRect(540), { x: 62, y: 127, w: 178, h: 43 });
+  assert.deepEqual(badgeRect(720), { x: 83, y: 169, w: 235, h: 56 });
+  assert.deepEqual(badgeRect(540), { x: 62, y: 127, w: 177, h: 42 });
 });
 
 test('badge stays in frame at every common width', () => {

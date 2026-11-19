@@ -1,6 +1,6 @@
 import * as inpainter from './inpainter.js';
 import * as video from './video.js';
-import { drawMask, badgeRect, badgeCoverage, INTRO_END_SECONDS } from './geometry.js';
+import { drawMask, badgeRect, verticalBadgeRect, watermarkRect, badgeCoverage, WATERMARK_START, WATERMARK_MORPH_START, INTRO_END_SECONDS } from './geometry.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -146,18 +146,23 @@ async function loadVideo(file) {
   els.preview.height = h;
   els.info.textContent = `${w} × ${h} · ${fmtTime(v.duration)}`;
 
-  // Look for the badge mid-clip, and for the tall intro state near the start.
-  const mid = await seek(v, Math.min(v.duration * 0.6, v.duration - 0.1));
+  // Look for the settled horizontal badge mid-clip, and for the animated vertical badge around 5.5s
+  const checkTimeMid = Math.max(0.1, Math.min(v.duration * 0.75, v.duration - 0.2));
+  const mid = await seek(v, checkTimeMid);
   ctx.drawImage(mid, 0, 0, w, h);
-  const badgeCov = badgeCoverage(ctx.getImageData(0, 0, w, h).data, w, h, INTRO_END_SECONDS + 1);
+  const badgeCov = badgeCoverage(ctx.getImageData(0, 0, w, h).data, w, h, 999);
 
-  const early = await seek(v, Math.min(0.8, v.duration - 0.1));
-  ctx.drawImage(early, 0, 0, w, h);
-  const introCov = badgeCoverage(ctx.getImageData(0, 0, w, h).data, w, h, 0);
+  let introCov = 0;
+  if (v.duration >= 6.0) {
+    const early = await seek(v, 5.5);
+    ctx.drawImage(early, 0, 0, w, h);
+    introCov = badgeCoverage(ctx.getImageData(0, 0, w, h).data, w, h, 5.5);
+  }
 
   prepareMasks(w, h);
-  state.useIntro = introCov > badgeCov;
-  reportDetection(Math.max(badgeCov, introCov), badgeCov >= introCov ? 'badge' : 'intro state');
+  state.useIntro = v.duration >= 8.0 && (introCov > 0.15 || badgeCov > 0.15);
+  const maxCov = Math.max(badgeCov, introCov);
+  reportDetection(maxCov, badgeCov >= introCov ? 'badge' : 'animated intro');
 
   await seek(v, 0.05);
   ctx.drawImage(v, 0, 0, w, h);
@@ -202,7 +207,7 @@ function prepareMasks(w, h) {
 
 function reportDetection(coverage, which) {
   const pct = Math.round(coverage * 100);
-  const found = coverage > 0.22;
+  const found = coverage > 0.15;
   els.detectDot.className = `dot ${found ? 'ok' : 'warn'}`;
   els.detectText.textContent = found
     ? `OpusClip ${which} found in the top-left corner (${pct}% of the mask box is white).`
@@ -219,13 +224,12 @@ function paintOutline() {
   const w = els.preview.width, h = els.preview.height;
   if (!w || !h) return;
 
-  // The canvas is letterboxed inside its stage, so position in pixels relative
-  // to the stage rather than in percentages of the wrapper.
   const cr = els.preview.getBoundingClientRect();
   const wr = els.wrap.getBoundingClientRect();
   if (!cr.width || !cr.height) return;
 
-  const r = badgeRect(w);
+  const t = state.video ? state.video.currentTime : 999;
+  const r = watermarkRect(w, t) || badgeRect(w);
   const sx = cr.width / w;
   const sy = cr.height / h;
 
