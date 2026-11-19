@@ -136,10 +136,9 @@ export async function processVideo(o) {
 
   // Active watermark state across time
   const getActiveState = () => {
-    const t = video.currentTime;
-    if (hasIntro && t < WATERMARK_START) return 'none';
-    if (hasIntro && t < WATERMARK_MORPH_START) return 'vertical';
-    return 'horizontal';
+    const rect = watermarkRect(width, video.currentTime);
+    if (!rect) return null;
+    return (rect.h > rect.w * 2) ? 'vertical' : 'horizontal';
   };
 
   // ---- patch state shared by both export paths ----
@@ -152,13 +151,13 @@ export async function processVideo(o) {
 
   async function repaint() {
     if (busy || signal?.aborted) return;
-    const state = getActiveState();
-    if (state === 'none') {
+    const rect = watermarkRect(width, video.currentTime);
+    if (!rect) {
       lastPatch = null;
       return;
     }
     busy = true;
-    const isVert = state === 'vertical';
+    const isVert = (rect.h > rect.w * 2);
     const runner = (isVert && runnerVert) ? runnerVert : runnerHoriz;
     const crop = (isVert && cropVert) ? cropVert : cropHoriz;
     const cropCtx = (isVert && cropCtxVert) ? cropCtxVert : cropCtxHoriz;
@@ -184,7 +183,7 @@ export async function processVideo(o) {
       }
       lastPatch = inpainter.extractPatch(result, runner.bbox, crop);
       if (lastPatch) {
-        lastPatch.state = state;
+        lastPatch.isVert = isVert;
         paintPatch(lastPatch);
       }
       patches++;
@@ -230,9 +229,12 @@ export async function processVideo(o) {
 
   function present() {
     outCtx.drawImage(video, 0, 0, width, height);
-    const state = getActiveState();
-    if (state !== 'none' && lastPatch && lastPatch.state === state) {
-      outCtx.drawImage(patchCanvas, lastPatch.x, lastPatch.y);
+    const rect = watermarkRect(width, video.currentTime);
+    if (rect && lastPatch) {
+      const isVert = (rect.h > rect.w * 2);
+      if (lastPatch.isVert === isVert) {
+        outCtx.drawImage(patchCanvas, lastPatch.x, lastPatch.y);
+      }
     }
     frames++;
   }
