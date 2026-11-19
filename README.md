@@ -11,63 +11,74 @@ on your GPU (or CPU) via WebGPU / WASM. Your video never leaves the machine.
 
 ## Why a dedicated tool
 
-The OpusClip badge is not placed by a model and it is not in a random spot. It is
-composited by OpusClip's renderer at a fixed anchor, so every export puts it in
-the same place:
-
-```
-1080 x 1920 reference frame
-  settled badge    x=123  y=254  w=355  h=85
-  intro animation  x=124  y=254  w=86   h=456   (vertical "Created with", first ~8.5 s)
-```
-
-Measured across four independent 1080×1920 exports: the badge silhouette was
-**pixel-identical** (11,033 px, XOR = 0, IoU = 100%), and the badge core is pure
-white regardless of the background behind it — i.e. fully opaque, so there is no
+The OpusClip badge is composited by OpusClip's renderer at a fixed anchor, so every
+export puts it in the same place, with the same pixels. Measured across several
+1080×1920 exports, the settled badge is **pixel-identical** and its core is pure
+white (min(R,G,B) ≥ 250) whatever is behind it — fully opaque, so there is no
 alpha to un-blend.
 
-That makes the problem much smaller than a general watermark remover:
-
-- no detection pass, no tracking, no drifting box;
-- one static mask, scaled by frame width;
-- a 512×512 crop around the badge is the model's native input size, so the pixels
-  go in and come back with **zero resampling**.
+The badge has two parts: an animated intro (vertical "Created with" text, then the
+logo slides up while "OpusClip" types in) and the settled horizontal badge that
+stays to the end. **When** that happens differs from clip to clip (a trimmed clip
+can have it from t = 0), so nothing here is keyed to the clock.
 
 ## How it works
 
 ```
-<video> ──drawImage(crop)──► 512×512 tile ──► MI-GAN (ONNX Runtime Web)
-   │                                              │
-   └──────────────► output canvas ◄───────────────┘
-                          │
-                    captureStream ──► MediaRecorder ──► MP4 / WebM
+MP4 ──mp4box──► samples ──VideoDecoder──► frame
+                                            │
+          512×512 window around the badge ◄─┘
+             │   detect badge pixels (exact silhouettes, per frame)
+             │   inpaint only those pixels  (MI-GAN or LaMa)
+             ▼
+   fill composited over the frame ──► VideoEncoder (H.264) ──► mp4-muxer ──► .mp4
+   AAC audio samples are copied through untouched
 ```
 
-- **Mask**: fixed geometry from `static/js/geometry.js`, scaled by width, 2 px pad.
-  The taller intro state is applied only for the first 8.5 s.
-- **Inpaint**: MI-GAN (Picsart Research, ICCV 2023), 29 MB ONNX, SHA-256 pinned,
-  cached in IndexedDB after the first download.
-- **Temporal smoothing**: median of the last 3 fills inside the mask only, which
-  removes the "boiling" that per-frame inpainting produces on hair and fabric.
-- **Export**: real-time `MediaRecorder` with the audio routed through WebAudio, so
-  audio stays locked to video even when inference is slower than playback.
+- **Exact mask.** Two silhouettes measured by pixel consensus ship as PNGs
+  (`static/assets/wm-*.png`). The mask is the logo and lettering *shape* grown by a
+  couple of pixels — about half the area of the old bounding box (≈16 k px vs
+  ≈33 k px at 1080 wide), so far less of the face under it gets reconstructed.
+- **Per-frame detection, no timeline.** `watermark.js` looks at the pixels:
+  *settled* when the horizontal silhouette is pure white (and sticky from then on),
+  *intro* when the vertical text or the sliding logo icon is found, *none* when
+  there is nothing to remove (the frame passes through untouched). A big white
+  caption card is not mistaken for the badge, and the game's own white subtitles
+  that cross the intro column are left alone.
+- **Frame-exact, not real-time.** Every frame is decoded, cleaned and encoded in
+  order with its own timestamp. The fill always belongs to the frame it is painted
+  on, no frames are dropped, and the source frame rate (e.g. 60 fps) is kept.
+- **Two models.**
+  - *Fast · MI-GAN* (29 MB, default). Clean and quick, soft on fine detail.
+  - *High quality · LaMa* (208 MB). Continues thin structures such as glasses
+    frames through the hole instead of smearing them. Measured on an integrated
+    Intel GPU: ~4.4 s per frame vs ~0.25 s for MI-GAN, so it is best for stills or
+    on a strong GPU. It needs ONNX Runtime Web ≥ 1.30 (1.20.1 fails on its FFC
+    layers under WebGPU and drops to WASM at ~5 s per frame).
+- **Temporal smoothing** (optional): median of the last 3 fills while the badge is
+  static and the picture under it is not moving.
 
 ## Honest limitations
 
 The badge is opaque, so the pixels under it are gone. This **reconstructs** the
 patch; it does not recover the original. Over flat walls, shadows and plain
-clothing the result is invisible. Over fine hair, text or detailed faces it can
-soften — that is the nature of inpainting, not a bug.
+clothing the result is invisible. Where the lettering crosses fine detail such as
+glasses frames or eyebrows, MI-GAN can leave a faint smudge on some frames; LaMa
+does noticeably better there.
 
-The mask geometry is measured from OpusClip's standard 9:16 layout. A different
-export style (different corner, different badge) needs different constants in
-`static/js/geometry.js`.
+The geometry is measured from OpusClip's standard 9:16 layout. A different export
+style (another corner, another badge) needs new silhouettes in `static/assets/` and
+new constants in `static/js/geometry.js`.
+
+Inputs the browser cannot demux (WebM, phone videos rotated by metadata) fall back
+to stepping a `<video>` element at an assumed 30 fps; that path is slower and only
+frame-accurate to about 1/30 s.
 
 ## Run locally
 
 ```bash
 node tools/serve.mjs          # http://localhost:8080
-npm test                      # pure-math regression tests
+npm test                      # pure-logic regression tests (no browser, no model)
 ```
 
 Any static server works. `tools/serve.mjs` additionally sets COOP/COEP so the
@@ -75,25 +86,23 @@ threaded WASM backend is enabled on localhost, matching production.
 
 ## Deploy
 
-The site is plain static files in `static/`. Push to GitHub, then:
-
-**Settings → Pages → Deploy from a branch → `main` / `/static`**
-
-No build step, no dependencies, no CI required. `.nojekyll` is included so the
-folder is served verbatim.
+The site is plain static files in `static/` (mirrored to `docs/` for GitHub Pages).
+Push to GitHub, then **Settings → Pages → Deploy from a branch → `main` / `/docs`**
+(or `/static`). No build step.
 
 Cross-origin isolation on GitHub Pages comes from `static/sw.js`, which re-emits
 same-origin responses with `Cross-Origin-Opener-Policy: same-origin` and
 `Cross-Origin-Embedder-Policy: require-corp`. Without those headers
 `SharedArrayBuffer` is unavailable and ONNX Runtime silently drops to
-single-threaded WASM (roughly 5× slower). WebGPU is unaffected either way.
+single-threaded WASM. WebGPU is unaffected either way.
 
 ## Privacy
 
 - No telemetry, no analytics, no error reporting.
 - No upload path exists in the code — check the Network tab while it runs.
-- The only network requests are the pinned ONNX runtime (jsDelivr) and the pinned
-  model (HuggingFace), both fetched once and cached.
+- The only network requests are the pinned ONNX runtime and mp4 libraries
+  (jsDelivr) and the pinned models (HuggingFace, SHA-256 verified), each fetched
+  once and cached.
 
 ## Files
 
@@ -101,10 +110,14 @@ single-threaded WASM (roughly 5× slower). WebGPU is unaffected either way.
 static/
   index.html            UI
   css/app.css
-  js/geometry.js        badge mask geometry (the measured constants)
-  js/inpainter.js       MI-GAN inference + tensor math (pure, tested)
+  assets/wm-horizontal.png  settled badge silhouette (measured)
+  assets/wm-vertical.png    intro text silhouette (measured)
+  js/geometry.js        badge geometry constants
+  js/watermark.js       per-frame badge detector → exact mask (pure core, tested)
+  js/inpainter.js       MI-GAN / LaMa inference + tensor math (pure, tested)
   js/model-cache.js     download, SHA-256 verify, IndexedDB cache
-  js/video.js           decode → inpaint → record pipeline
+  js/demux.js           mp4box demux (video + AAC samples)
+  js/video.js           decode → detect → inpaint → encode pipeline
   js/app.js             controller
   js/coi-bootstrap.js   service-worker registration for COOP/COEP
   sw.js                 offline shell + isolation headers
@@ -116,7 +129,9 @@ tools/
 ## Credits
 
 - [MI-GAN](https://github.com/Picsart-AI-Research/MI-GAN) — Picsart Research, ICCV 2023
+- [LaMa](https://github.com/advimman/lama) — Samsung AI; ONNX export by [Carve](https://huggingface.co/Carve/LaMa-ONNX)
 - [ONNX Runtime Web](https://onnxruntime.ai/)
+- [mp4box.js](https://github.com/gpac/mp4box.js) and [mp4-muxer](https://github.com/Vanilagy/mp4-muxer)
 - [lxfater/inpaint-web](https://github.com/lxfater/inpaint-web) — reference MI-GAN export
 - [coi-serviceworker](https://github.com/gzuidhof/coi-serviceworker) — the isolation pattern
 

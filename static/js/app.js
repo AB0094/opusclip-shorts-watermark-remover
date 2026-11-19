@@ -1,6 +1,8 @@
 import * as inpainter from './inpainter.js';
 import * as video from './video.js';
-import { drawMask, badgeRect, verticalBadgeRect, watermarkRect, badgeCoverage, WATERMARK_START, WATERMARK_MORPH_START, INTRO_END_SECONDS } from './geometry.js';
+import { MODELS } from './model-cache.js';
+import { createDetector } from './watermark.js';
+import { badgeRect } from './geometry.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -16,7 +18,8 @@ const els = {
   outline: $('badge-outline'),
   showMask: $('show-mask'),
   temporal: $('temporal'),
-  refine: $('refine'),
+  model: $('model'),
+  modelNote: $('model-note'),
   run: $('run'),
   cancel: $('cancel'),
   download: $('download'),
@@ -33,19 +36,35 @@ const els = {
 const state = {
   file: null,
   kind: null,          // 'video' | 'image'
-  video: null,
   image: null,         // ImageData of the still
-  maskIntro: null,     // ImageData, includes intro state
-  maskBadge: null,     // ImageData, badge only
-  useIntro: false,
   resultURL: null,
   controller: null,
-  modelReady: false,
+  loadToken: 0,
 };
 
-// Deliberately not willReadFrequently: the preview canvas is also the frame
-// source for VideoEncoder, which needs a normal (GPU-backed) 2D context.
 const ctx = els.preview.getContext('2d');
+
+/* ---------------------------- model picker ---------------------------- */
+
+for (const spec of Object.values(MODELS)) {
+  const opt = document.createElement('option');
+  opt.value = spec.id;
+  opt.textContent = `${spec.label} (${Math.round(spec.bytes / 1048576)} MB)`;
+  els.model.appendChild(opt);
+}
+try { els.model.value = localStorage.getItem('opusclip-model') || 'migan'; } catch { /* storage blocked */ }
+if (!els.model.value) els.model.value = 'migan';
+
+const MODEL_NOTES = {
+  migan: 'Quick, a little soft on fine detail such as glasses frames.',
+  lama: 'Reconstructs thin structures (glasses, hair strands) much better. One-time 208 MB download; several times slower per frame, so clips take minutes.',
+};
+function showModelNote() {
+  els.modelNote.textContent = MODEL_NOTES[els.model.value] || '';
+  try { localStorage.setItem('opusclip-model', els.model.value); } catch { /* storage blocked */ }
+}
+els.model.addEventListener('change', showModelNote);
+showModelNote();
 
 /* ---------------------------- file intake ---------------------------- */
 
@@ -84,6 +103,7 @@ els.showMask.addEventListener('change', paintOutline);
 
 async function load(file) {
   reset();
+  const token = ++state.loadToken;
   state.file = file;
   els.name.textContent = file.name;
   els.studio.hidden = false;
@@ -94,12 +114,21 @@ async function load(file) {
     if (file.type.startsWith('image/')) {
       await loadImage(file);
     } else {
-      await loadVideo(file);
+      await loadVideo(file, token);
     }
   } catch (err) {
     console.error(err);
     setStatus(err.message || 'Could not read that file.', true);
   }
+}
+
+/** Window of the frame the detector looks at, as RGBA on the 512 model grid. */
+function windowPixels(source, detector) {
+  const { plan } = detector;
+  const c = new OffscreenCanvas(inpainter.SIZE, inpainter.SIZE);
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.drawImage(source, plan.x, plan.y, plan.win, plan.win, 0, 0, inpainter.SIZE, inpainter.SIZE);
+  return g.getImageData(0, 0, inpainter.SIZE, inpainter.SIZE);
 }
 
 async function loadImage(file) {
@@ -114,17 +143,15 @@ async function loadImage(file) {
   state.image = ctx.getImageData(0, 0, w, h);
   els.info.textContent = `${w} × ${h} · still image`;
 
-  prepareMasks(w, h);
-  const badgeCov = badgeCoverage(state.image.data, w, h, INTRO_END_SECONDS + 1);
-  const introCov = badgeCoverage(state.image.data, w, h, 0);
-  state.useIntro = introCov > badgeCov;
-  reportDetection(Math.max(badgeCov, introCov), badgeCov >= introCov ? 'badge' : 'intro state');
+  const detector = await createDetector(w, h);
+  const verdict = detector.analyze(windowPixels(els.preview, detector).data, { still: true });
+  reportDetection(verdict.state);
   els.run.textContent = 'Remove watermark';
   paintOutline();
-  setStatus('Ready. The model downloads once (~29 MB) and is then cached.');
+  setStatus('Ready.');
 }
 
-async function loadVideo(file) {
+async function loadVideo(file, token) {
   const url = URL.createObjectURL(file);
   const v = document.createElement('video');
   v.src = url;
@@ -132,86 +159,62 @@ async function loadVideo(file) {
   v.playsInline = true;
   v.preload = 'auto';
 
-  await new Promise((resolve, reject) => {
-    v.onloadedmetadata = resolve;
-    v.onerror = () => reject(new Error('Could not decode this video. Try MP4/H.264.'));
-  });
+  try {
+    await new Promise((resolve, reject) => {
+      v.onloadedmetadata = resolve;
+      v.onerror = () => reject(new Error('Could not decode this video. Try MP4/H.264.'));
+    });
 
-  const w = v.videoWidth & ~1;
-  const h = v.videoHeight & ~1;
-  state.video = v;
-  state.kind = 'video';
+    const w = v.videoWidth & ~1;
+    const h = v.videoHeight & ~1;
+    state.kind = 'video';
+    els.preview.width = w;
+    els.preview.height = h;
+    els.info.textContent = `${w} × ${h} · ${fmtTime(v.duration)}`;
 
-  els.preview.width = w;
-  els.preview.height = h;
-  els.info.textContent = `${w} × ${h} · ${fmtTime(v.duration)}`;
+    // Sample a handful of frames: the badge may not be there yet at t=0, and
+    // once it has appeared it stays to the end.
+    const detector = await createDetector(w, h);
+    const times = [0.05, 0.25, 0.45, 0.65, 0.85, 0.97].map((f) => Math.min(v.duration - 0.1, f * v.duration));
+    let best = 'none';
+    let previewAt = times[times.length - 1];
+    for (const t of times) {
+      if (token !== state.loadToken) return;
+      await seek(v, Math.max(0.05, t));
+      const verdict = detector.analyze(windowPixels(v, detector).data, { still: true });
+      if (verdict.state === 'settled') { best = 'settled'; previewAt = t; break; }
+      if (verdict.state === 'anim') { best = 'anim'; previewAt = t; }
+    }
+    if (token !== state.loadToken) return;
 
-  // Look for the settled horizontal badge mid-clip, and for the animated vertical badge around 5.5s
-  const checkTimeMid = Math.max(0.1, Math.min(v.duration * 0.75, v.duration - 0.2));
-  const mid = await seek(v, checkTimeMid);
-  ctx.drawImage(mid, 0, 0, w, h);
-  const badgeCov = badgeCoverage(ctx.getImageData(0, 0, w, h).data, w, h, 999);
-
-  let introCov = 0;
-  if (v.duration >= 6.0) {
-    const early = await seek(v, 5.5);
-    ctx.drawImage(early, 0, 0, w, h);
-    introCov = badgeCoverage(ctx.getImageData(0, 0, w, h).data, w, h, 5.5);
+    await seek(v, Math.max(0.05, previewAt));
+    ctx.drawImage(v, 0, 0, w, h);
+    reportDetection(best);
+    els.run.textContent = 'Remove watermark';
+    paintOutline();
+    setStatus('Ready. Everything runs locally; the model downloads once and is then cached.');
+  } finally {
+    URL.revokeObjectURL(url);
   }
-
-  prepareMasks(w, h);
-  state.useIntro = v.duration >= 8.0 && (introCov > 0.15 || badgeCov > 0.15);
-  const maxCov = Math.max(badgeCov, introCov);
-  reportDetection(maxCov, badgeCov >= introCov ? 'badge' : 'animated intro');
-
-  await seek(v, 0.05);
-  ctx.drawImage(v, 0, 0, w, h);
-  state.video.currentTime = 0;
-  els.run.textContent = 'Remove watermark';
-  paintOutline();
-  setStatus('Ready. The model downloads once (~29 MB) and is then cached.');
 }
 
 function seek(v, t) {
   return new Promise((resolve) => {
-    let resolved = false;
-    const finish = () => {
-      if (!resolved) {
-        resolved = true;
-        resolve(v);
-      }
-    };
-    if ('requestVideoFrameCallback' in v) {
-      v.requestVideoFrameCallback(() => finish());
-    }
-    v.addEventListener('seeked', () => {
-      setTimeout(finish, 80);
-    }, { once: true });
+    let finished = false;
+    const finish = () => { if (!finished) { finished = true; resolve(); } };
+    v.addEventListener('seeked', () => setTimeout(finish, 60), { once: true });
+    setTimeout(finish, 2500);
     v.currentTime = t;
-    if (Math.abs(v.currentTime - t) < 0.001) setTimeout(finish, 80);
   });
 }
 
-function prepareMasks(w, h) {
-  const make = (includeIntro) => {
-    const c = document.createElement('canvas');
-    c.width = w;
-    c.height = h;
-    const cctx = c.getContext('2d', { willReadFrequently: true });
-    drawMask(cctx, w, h, { includeIntro });
-    return cctx.getImageData(0, 0, w, h);
-  };
-  state.maskBadge = make(false);
-  state.maskIntro = make(true);
-}
-
-function reportDetection(coverage, which) {
-  const pct = Math.round(coverage * 100);
-  const found = coverage > 0.15;
+function reportDetection(kind) {
+  const found = kind !== 'none';
   els.detectDot.className = `dot ${found ? 'ok' : 'warn'}`;
-  els.detectText.textContent = found
-    ? `OpusClip ${which} found in the top-left corner (${pct}% of the mask box is white).`
-    : `No clear badge in the expected corner (${pct}% coverage). It may already be clean, or use a different layout — check “Show mask”.`;
+  els.detectText.textContent =
+    kind === 'settled' ? 'OpusClip badge found in the top-left corner.'
+      : kind === 'anim' ? 'OpusClip intro animation found in the top-left corner.'
+        : 'No OpusClip badge found in the sampled frames. It may already be clean, or use a different layout.';
 }
 
 /* ------------------------------ preview ------------------------------ */
@@ -228,8 +231,7 @@ function paintOutline() {
   const wr = els.wrap.getBoundingClientRect();
   if (!cr.width || !cr.height) return;
 
-  const t = state.video ? state.video.currentTime : 999;
-  const r = watermarkRect(w, t) || badgeRect(w);
+  const r = badgeRect(w);
   const sx = cr.width / w;
   const sy = cr.height / h;
 
@@ -247,28 +249,32 @@ if ('ResizeObserver' in window) new ResizeObserver(paintOutline).observe(els.wra
 /* ------------------------------- run -------------------------------- */
 
 async function ensureModel() {
-  if (state.modelReady) return;
+  const id = els.model.value;
+  if (inpainter.isReady() && inpainter.getModelId() === id) return;
   els.backend.textContent = 'loading model…';
   els.backend.classList.add('busy');
-  await inpainter.init((p) => {
-    if (p.stage) {
-      els.backend.textContent = p.stage;
-      if (p.total) {
-        els.progressWrap.hidden = false;
-        const pct = (p.done / p.total) * 100;
-        els.bar.style.width = `${pct}%`;
-        els.progressText.textContent = `${p.stage} — ${Math.round(pct)}%`;
+  try {
+    await inpainter.init(id, (p) => {
+      if (p.stage) {
+        els.backend.textContent = p.stage;
+        if (p.total) {
+          els.progressWrap.hidden = false;
+          const pct = (p.done / p.total) * 100;
+          els.bar.style.width = `${pct}%`;
+          els.progressText.textContent = `${p.stage} — ${Math.round(pct)}%`;
+        }
       }
-    }
-  });
-  state.modelReady = true;
-  els.backend.classList.remove('busy');
-  els.backend.textContent = `model ready · ${inpainter.getBackend()}`;
+    });
+  } finally {
+    els.backend.classList.remove('busy');
+  }
+  els.backend.textContent = `${id} · ${inpainter.getBackend()}`;
 }
 
 els.run.addEventListener('click', async () => {
   if (!state.file) return;
   els.run.disabled = true;
+  els.model.disabled = true;
   els.download.hidden = true;
   els.cancel.hidden = false;
   els.progressWrap.hidden = false;
@@ -292,6 +298,7 @@ els.run.addEventListener('click', async () => {
     }
   } finally {
     els.run.disabled = false;
+    els.model.disabled = false;
     els.cancel.hidden = true;
     state.controller = null;
   }
@@ -301,50 +308,59 @@ els.cancel.addEventListener('click', () => state.controller?.abort());
 
 async function runImage() {
   const w = els.preview.width, h = els.preview.height;
-  const mask = state.useIntro ? state.maskIntro : state.maskBadge;
-  const src = new ImageData(new Uint8ClampedArray(state.image.data), w, h);
+  const detector = await createDetector(w, h);
+  const { plan } = detector;
+
+  ctx.putImageData(state.image, 0, 0);
+  const win = windowPixels(els.preview, detector);
+  const verdict = detector.analyze(win.data, { still: true });
+  if (!verdict.mask) {
+    els.bar.style.width = '100%';
+    els.progressText.textContent = 'Nothing to remove';
+    setStatus('No badge pixels found in the expected corner, so the image was left unchanged.');
+    return;
+  }
 
   setStatus('Inpainting…');
   els.bar.style.width = '35%';
-  const result = await inpainter.inpaint(src, mask, { passes: els.refine.checked ? 2 : 1 });
+  const filled = await inpainter.fill(win.data, verdict.mask);
 
-  ctx.putImageData(result, 0, 0);
+  const overlay = new OffscreenCanvas(inpainter.SIZE, inpainter.SIZE);
+  overlay.getContext('2d').putImageData(
+    new ImageData(inpainter.buildOverlay(filled, verdict.mask), inpainter.SIZE, inpainter.SIZE), 0, 0);
+  ctx.imageSmoothingEnabled = plan.win !== inpainter.SIZE;
+  ctx.drawImage(overlay, 0, 0, inpainter.SIZE, inpainter.SIZE, plan.x, plan.y, plan.win, plan.win);
+
   els.bar.style.width = '100%';
   els.progressText.textContent = 'Done';
-  setStatus('Done — download or adjust the settings and run again.');
-
-  const c = document.createElement('canvas');
-  c.width = w; c.height = h;
-  c.getContext('2d').putImageData(result, 0, 0);
-  c.toBlob((blob) => offerDownload(blob, `clean-${state.file.name.replace(/\.[^.]+$/, '')}.png`), 'image/png');
+  setStatus('Done — download the result.');
+  els.preview.toBlob((blob) => offerDownload(blob, `clean-${state.file.name.replace(/\.[^.]+$/, '')}.png`), 'image/png');
 }
 
 async function runVideo() {
-  const v = state.video;
-  v.currentTime = 0;
-
-  setStatus('Recording and inpainting in real time…');
+  setStatus('Processing every frame…');
   els.progressText.textContent = 'Preparing…';
   els.bar.style.width = '0%';
 
-  const { blob, mimeType } = await video.processVideo({
+  const result = await video.processVideo({
     file: state.file,
     canvas: els.preview,
-    intro: state.useIntro,
     temporal: els.temporal.checked,
-    passes: els.refine.checked ? 2 : 1,
     signal: state.controller.signal,
-    onProgress: ({ value }) => {
+    onInfo: ({ backend }) => { els.backend.textContent = backend; },
+    onProgress: ({ value, fps }) => {
       const pct = Math.min(99, Math.round(value * 100));
       els.bar.style.width = `${pct}%`;
-      els.progressText.textContent = `Inpainting — ${pct}%`;
+      els.progressText.textContent = `Frame by frame — ${pct}% · ${fps.toFixed(1)} fps`;
     },
   });
 
+  const { blob, stats, audioNote } = result;
   els.bar.style.width = '100%';
   els.progressText.textContent = 'Done';
-  setStatus(`Done · ${(blob.size / 1048576).toFixed(1)} MB ${/mp4/.test(mimeType) ? 'MP4' : 'WebM'}`);
-  offerDownload(blob, video.outputName(state.file.name, mimeType));
+  const cleaned = stats.settled + stats.anim;
+  setStatus(`Done · ${(blob.size / 1048576).toFixed(1)} MB MP4 · badge removed on ${cleaned} of ${stats.frames} frames · ${audioNote}`);
+  offerDownload(blob, video.outputName(state.file.name));
 }
 
 function offerDownload(blob, filename) {
@@ -370,15 +386,13 @@ function fmtTime(sec) {
 }
 
 function reset() {
+  state.loadToken++;
   if (state.resultURL) URL.revokeObjectURL(state.resultURL);
   state.controller?.abort();
-  state.video?.pause?.();
   state.file = null;
   state.kind = null;
-  state.video = null;
   state.image = null;
   state.resultURL = null;
-  state.useIntro = false;
 
   els.studio.hidden = true;
   els.dropzone.hidden = false;
@@ -389,6 +403,6 @@ function reset() {
   els.status.textContent = '';
   els.status.classList.remove('error');
   els.detectDot.className = 'dot';
-  els.detectText.textContent = 'Read the first frame to check for the badge…';
+  els.detectText.textContent = 'Checking a few frames for the badge…';
   els.file.value = '';
 }

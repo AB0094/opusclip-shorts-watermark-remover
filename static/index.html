@@ -8,7 +8,7 @@
 <meta name="theme-color" content="#0b0d12" />
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%230b0d12'/><circle cx='50' cy='44' r='15' fill='none' stroke='%237c5cff' stroke-width='9'/><path d='M38 56v30' stroke='%237c5cff' stroke-width='9' stroke-linecap='round'/></svg>" />
 <link rel="stylesheet" href="css/app.css" />
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.js" crossorigin="anonymous" defer></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.js" crossorigin="anonymous" defer></script>
 </head>
 <body>
 <div class="ambient" aria-hidden="true"></div>
@@ -31,14 +31,14 @@
   <section class="hero">
     <h1>Strip the badge from your shorts</h1>
     <p class="lede">
-      The OpusClip badge always lands in the same corner. This finds that corner,
-      inpaints it per frame with MI-GAN, and gives you the clip back —
+      The OpusClip badge always lands in the same corner. This finds the badge
+      pixel by pixel, inpaints just its outline on every frame, and gives you the clip back —
       <strong>on your machine</strong>. No upload, no account, no queue.
     </p>
     <ul class="ticks">
-      <li>Fixed badge geometry, scaled to any 9:16 export</li>
-      <li>WebGPU, with WASM fallback</li>
-      <li>Audio preserved, MP4 out</li>
+      <li>Exact logo-shaped mask, scaled to any 9:16 export</li>
+      <li>Frame-exact decode, WebGPU with WASM fallback</li>
+      <li>Audio copied untouched, MP4 out</li>
     </ul>
   </section>
 
@@ -90,10 +90,11 @@
           <input type="checkbox" id="temporal" checked />
           <span>Temporal smoothing <em>reduces shimmer on hair</em></span>
         </label>
-        <label class="switch">
-          <input type="checkbox" id="refine" />
-          <span>Refine pass <em>slower, sharper</em></span>
+        <label class="field">
+          <span>Inpainting model</span>
+          <select id="model"></select>
         </label>
+        <p class="muted small" id="model-note"></p>
       </div>
 
       <div class="progress" id="progress-wrap" hidden>
@@ -113,8 +114,9 @@
           The badge is fully opaque, so the pixels underneath it are gone — this
           <em>reconstructs</em> that patch, it does not recover the original. Over
           flat walls and shadows it is invisible; over fine hair or text it can
-          soften. The mask is a fixed top-left box: 355×85 px at 1080×1920, plus
-          the taller intro state for the first ~8.5 s.
+          soften. The mask follows the exact shape of the logo and lettering
+          (not a box), recognised per frame from the pixels, so it works on any
+          clip, including the animated intro.
         </p>
       </details>
     </aside>
@@ -123,8 +125,9 @@
 
 <footer>
   <p>
-    Open source, MIT. Model: <a href="https://github.com/Picsart-AI-Research/MI-GAN" target="_blank" rel="noreferrer">MI-GAN</a>
-    (Picsart Research, ICCV 2023) via ONNX Runtime Web.
+    Open source, MIT. Models: <a href="https://github.com/Picsart-AI-Research/MI-GAN" target="_blank" rel="noreferrer">MI-GAN</a>
+    (Picsart Research, ICCV 2023) and <a href="https://github.com/advimman/lama" target="_blank" rel="noreferrer">LaMa</a>
+    (Samsung AI), via ONNX Runtime Web.
   </p>
 </footer>
 

@@ -10,7 +10,7 @@
  * untouched.
  */
 
-const CACHE = 'opusclip-remover-v7';
+const CACHE = 'opusclip-remover-v8';
 
 const SHELL = [
   './',
@@ -18,10 +18,14 @@ const SHELL = [
   'css/app.css',
   'js/app.js',
   'js/geometry.js',
+  'js/watermark.js',
   'js/inpainter.js',
   'js/model-cache.js',
+  'js/demux.js',
   'js/video.js',
   'js/coi-bootstrap.js',
+  'assets/wm-horizontal.png',
+  'assets/wm-vertical.png',
 ];
 
 self.addEventListener('install', (event) => {

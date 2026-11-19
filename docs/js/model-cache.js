@@ -1,22 +1,34 @@
 /**
- * MI-GAN model loader with an IndexedDB cache and a hard integrity check.
+ * Model loader with an IndexedDB cache and a hard integrity check.
  *
- * The ONNX file is ~29 MB and comes from a third-party HuggingFace repository
- * that we do not control, and we then execute it inside the page. So the bytes
- * are SHA-256 verified before they are trusted, and only verified bytes are
- * ever written to the cache.
+ * The ONNX files come from third-party HuggingFace repositories that we do not
+ * control, and we then execute them inside the page. So the bytes are SHA-256
+ * verified before they are trusted, and only verified bytes are ever cached.
  */
 
 const DB_NAME = 'opusclip-remover';
 const DB_VERSION = 1;
 const STORE = 'models';
-const MODEL_KEY = 'migan_v1';
 
-const MODEL_URL = 'https://huggingface.co/lxfater/inpaint-web/resolve/main/migan.onnx';
-
-// SHA-256 of migan.onnx (29,541,096 bytes).
-// Recompute with:  curl -sL <MODEL_URL> | sha256sum
-const MODEL_SHA256 = 'bb7189b2523b8485d9dd6baa2e7e8bccce4493760daa33ffcd432f667945bf62';
+export const MODELS = {
+  migan: {
+    id: 'migan',
+    label: 'Fast · MI-GAN',
+    cacheKey: 'migan_v1',
+    url: 'https://huggingface.co/lxfater/inpaint-web/resolve/main/migan.onnx',
+    // Recompute with:  curl -sL <url> | sha256sum
+    sha256: 'bb7189b2523b8485d9dd6baa2e7e8bccce4493760daa33ffcd432f667945bf62',
+    bytes: 29541096,
+  },
+  lama: {
+    id: 'lama',
+    label: 'High quality · LaMa',
+    cacheKey: 'lama_fp32_v1',
+    url: 'https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx',
+    sha256: '1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6',
+    bytes: 208044816,
+  },
+};
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -50,29 +62,29 @@ async function idbSet(key, value) {
 
 async function sha256Hex(bytes) {
   const h = await crypto.subtle.digest('SHA-256', bytes);
-  return Array.from(new Uint8Array(h)).map(b => b.toString(16).padStart(2, '0')).join('');
+  return Array.from(new Uint8Array(h)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function verify(bytes, source) {
+async function verify(spec, bytes, source) {
   if (!globalThis.crypto?.subtle) {
     console.warn('[model] crypto.subtle unavailable (insecure context) — skipping integrity check');
     return;
   }
   const hash = await sha256Hex(bytes);
-  if (hash !== MODEL_SHA256) {
+  if (hash !== spec.sha256) {
     throw new Error(
-      `Model integrity check failed for ${source}. Expected ${MODEL_SHA256.slice(0, 16)}…, got ${hash.slice(0, 16)}…. ` +
+      `Model integrity check failed for ${source}. Expected ${spec.sha256.slice(0, 16)}…, got ${hash.slice(0, 16)}…. ` +
       'The bytes were rejected and nothing was cached.'
     );
   }
-  console.log(`[model] integrity verified (${source})`);
+  console.log(`[model] ${spec.id} integrity verified (${source})`);
 }
 
-async function download(onProgress) {
-  const res = await fetch(MODEL_URL, { cache: 'force-cache', mode: 'cors' });
+async function download(spec, onProgress) {
+  const res = await fetch(spec.url, { cache: 'force-cache', mode: 'cors' });
   if (!res.ok) throw new Error(`Model download failed: HTTP ${res.status} ${res.statusText}`);
 
-  const total = parseInt(res.headers.get('content-length') || '0', 10);
+  const total = parseInt(res.headers.get('content-length') || '0', 10) || spec.bytes;
   if (!res.body) {
     const buf = await res.arrayBuffer();
     onProgress?.({ done: buf.byteLength, total: buf.byteLength, stage: 'Downloaded' });
@@ -96,16 +108,22 @@ async function download(onProgress) {
 }
 
 /**
+ * @param {keyof typeof MODELS} id
  * @param {(p:{done:number,total:number,stage?:string,cached?:boolean}) => void} onProgress
  * @returns {Promise<Uint8Array>} verified ONNX bytes
  */
-export async function loadModel(onProgress) {
+export async function loadModel(id, onProgress) {
+  const spec = MODELS[id];
+  if (!spec) throw new Error(`Unknown model "${id}".`);
+
   try {
-    const cached = await idbGet(MODEL_KEY);
-    if (cached && cached.byteLength > 1_000_000) {
-      console.log('[model] cache hit');
-      onProgress?.({ done: cached.byteLength, total: cached.byteLength, cached: true, stage: 'Loaded from this device' });
-      return new Uint8Array(cached);
+    const cached = await idbGet(spec.cacheKey);
+    // Stored as a Blob (file-backed, fast for 200 MB); older builds stored an ArrayBuffer.
+    const buf = cached instanceof Blob ? await cached.arrayBuffer() : cached;
+    if (buf && buf.byteLength === spec.bytes) {
+      console.log(`[model] ${id} cache hit`);
+      onProgress?.({ done: buf.byteLength, total: buf.byteLength, cached: true, stage: 'Loaded from this device' });
+      return new Uint8Array(buf);
     }
   } catch (e) {
     console.warn('[model] IndexedDB read failed, downloading instead:', e);
@@ -116,30 +134,26 @@ export async function loadModel(onProgress) {
   }
 
   onProgress?.({ done: 0, total: 0, stage: 'Connecting…' });
-  const bytes = await download(onProgress);
+  const bytes = await download(spec, onProgress);
 
   onProgress?.({ done: bytes.byteLength, total: bytes.byteLength, stage: 'Verifying…' });
-  await verify(bytes, 'the download');
+  await verify(spec, bytes, 'the download');
 
-  try {
-    await idbSet(MODEL_KEY, bytes.buffer);
-    console.log(`[model] cached (${(bytes.byteLength / 1048576).toFixed(1)} MB)`);
-  } catch (e) {
-    console.warn('[model] could not cache the model:', e);
-  }
+  // Cache in the background: a slow or failing write must never hold up the run.
+  idbSet(spec.cacheKey, new Blob([bytes], { type: 'application/octet-stream' }))
+    .then(() => console.log(`[model] ${id} cached (${(bytes.byteLength / 1048576).toFixed(1)} MB)`))
+    .catch((e) => console.warn('[model] could not cache the model:', e));
 
   return bytes;
 }
 
-export async function clearModel() {
+export async function clearModel(id) {
   try {
     const db = await openDB();
     return await new Promise((resolve) => {
-      const req = db.transaction(STORE, 'readwrite').objectStore(STORE).delete(MODEL_KEY);
+      const req = db.transaction(STORE, 'readwrite').objectStore(STORE).delete(MODELS[id].cacheKey);
       req.onsuccess = () => resolve(true);
       req.onerror = () => resolve(false);
     });
   } catch { return false; }
 }
-
-export const MODEL_BYTES = 29541096;
