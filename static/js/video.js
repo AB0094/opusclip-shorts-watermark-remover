@@ -252,7 +252,7 @@ export async function processVideo(o) {
   let result;
   if (muxerMod && typeof VideoEncoder !== 'undefined') {
     result = await encodeWebCodecs({
-      ...o, muxerMod, video, out, outCtx, present, repaint, crop, width, height,
+      ...o, muxerMod, video, out, outCtx, present, repaint, width, height,
       repaintBusy: () => busy,
     });
   } else {
