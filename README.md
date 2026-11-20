@@ -55,6 +55,15 @@ MP4 ──mp4box──► samples ──VideoDecoder──► frame
     Intel GPU: ~4.4 s per frame vs ~0.25 s for MI-GAN, so it is best for stills or
     on a strong GPU. It needs ONNX Runtime Web ≥ 1.30 (1.20.1 fails on its FFC
     layers under WebGPU and drops to WASM at ~5 s per frame).
+- **Fill reuse (Speed setting).** Once the badge has settled, the model only needs
+  to run again when the pixels in a thin band around the badge change. Each frame
+  compares that band with the frame the model last ran on; if nothing moved, the
+  previous fill is composited again and the model is skipped. *Balanced* (default)
+  reuses a fill for up to 5 frames, *Turbo* for up to 15 with looser limits, and
+  *Max quality* runs the model on every frame like before. On talking-head shorts
+  this typically cuts model runs by 3 to 6 times, and the model is almost all of
+  the processing time.
+- **Hardware H.264 encoding** is requested first, with software as the fallback.
 - **Temporal smoothing** (optional): median of the last 3 fills while the badge is
   static and the picture under it is not moving.
 

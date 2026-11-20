@@ -238,3 +238,54 @@ export function patchMotion(a, b, mask, stride = 2) {
   }
   return n ? sum / n : 0;
 }
+
+/* ------------------------------------------------------------------ *
+ * Fill reuse (speed)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Pixel indices of the band just outside the mask: `grown` minus `mask`.
+ * The model's fill is driven by these pixels, so while they stay put the
+ * previous fill is still right and the model does not need to run again.
+ */
+export function bandIndices(mask, grown) {
+  let n = 0;
+  for (let i = 0; i < mask.length; i++) if (grown[i] && !mask[i]) n++;
+  const out = new Int32Array(n);
+  n = 0;
+  for (let i = 0; i < mask.length; i++) if (grown[i] && !mask[i]) out[n++] = i;
+  return out;
+}
+
+/**
+ * How much the band changed between two RGBA windows.
+ * Returns the mean absolute channel difference and the fraction of band pixels
+ * that changed a lot (catches a small object moving in while the mean stays low).
+ */
+export function bandChange(a, b, band, bigDelta = 28) {
+  if (!band.length) return { mean: 0, moved: 0 };
+  let sum = 0, big = 0;
+  for (let k = 0; k < band.length; k++) {
+    const p = band[k] * 4;
+    const d = Math.abs(a[p] - b[p]) + Math.abs(a[p + 1] - b[p + 1]) + Math.abs(a[p + 2] - b[p + 2]);
+    sum += d;
+    if (d > bigDelta * 3) big++;
+  }
+  return { mean: sum / (band.length * 3), moved: big / band.length };
+}
+
+/**
+ * Speed presets. `maxReuse` is how many frames in a row may reuse one fill;
+ * `mean` / `moved` are the bandChange limits under which reuse is allowed.
+ */
+export const SPEED_PRESETS = {
+  quality:  { maxReuse: 0,  mean: 0,   moved: 0 },
+  balanced: { maxReuse: 5,  mean: 2.5, moved: 0.01 },
+  turbo:    { maxReuse: 15, mean: 5,   moved: 0.03 },
+};
+
+/** Should the previous fill be reused for this frame? Pure, tested. */
+export function canReuse(change, age, preset) {
+  return preset.maxReuse > 0 && age < preset.maxReuse
+    && change.mean <= preset.mean && change.moved <= preset.moved;
+}

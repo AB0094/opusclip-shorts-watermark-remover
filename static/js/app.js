@@ -18,6 +18,7 @@ const els = {
   outline: $('badge-outline'),
   showMask: $('show-mask'),
   temporal: $('temporal'),
+  speed: $('speed'),
   model: $('model'),
   modelNote: $('model-note'),
   run: $('run'),
@@ -64,6 +65,12 @@ function showModelNote() {
   try { localStorage.setItem('opusclip-model', els.model.value); } catch { /* storage blocked */ }
 }
 els.model.addEventListener('change', showModelNote);
+
+try { els.speed.value = localStorage.getItem('opusclip-speed') || 'balanced'; } catch { /* storage blocked */ }
+if (!els.speed.value) els.speed.value = 'balanced';
+els.speed.addEventListener('change', () => {
+  try { localStorage.setItem('opusclip-speed', els.speed.value); } catch { /* storage blocked */ }
+});
 showModelNote();
 
 /* ---------------------------- file intake ---------------------------- */
@@ -275,6 +282,7 @@ els.run.addEventListener('click', async () => {
   if (!state.file) return;
   els.run.disabled = true;
   els.model.disabled = true;
+  els.speed.disabled = true;
   els.download.hidden = true;
   els.cancel.hidden = false;
   els.progressWrap.hidden = false;
@@ -299,6 +307,7 @@ els.run.addEventListener('click', async () => {
   } finally {
     els.run.disabled = false;
     els.model.disabled = false;
+    els.speed.disabled = false;
     els.cancel.hidden = true;
     state.controller = null;
   }
@@ -346,6 +355,7 @@ async function runVideo() {
     file: state.file,
     canvas: els.preview,
     temporal: els.temporal.checked,
+    speed: els.speed.value,
     signal: state.controller.signal,
     onInfo: ({ backend }) => { els.backend.textContent = backend; },
     onProgress: ({ value, fps }) => {
@@ -359,7 +369,7 @@ async function runVideo() {
   els.bar.style.width = '100%';
   els.progressText.textContent = 'Done';
   const cleaned = stats.settled + stats.anim;
-  setStatus(`Done · ${(blob.size / 1048576).toFixed(1)} MB MP4 · badge removed on ${cleaned} of ${stats.frames} frames · ${audioNote}`);
+  setStatus(`Done · ${(blob.size / 1048576).toFixed(1)} MB MP4 · badge removed on ${cleaned} of ${stats.frames} frames (model ran ${stats.inferred}×, reused ${stats.reused}×) · ${audioNote}`);
   offerDownload(blob, video.outputName(state.file.name));
 }
 

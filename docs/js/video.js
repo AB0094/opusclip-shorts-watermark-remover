@@ -19,7 +19,7 @@
  * stepping a <video> element frame by frame at an assumed 30 fps.
  */
 
-import { createDetector } from './watermark.js';
+import { createDetector, dilate } from './watermark.js';
 import * as inpainter from './inpainter.js';
 import { demux } from './demux.js';
 
@@ -167,6 +167,7 @@ async function openSource(file, signal) {
  * @param {string} [o.modelId]                model id the caller already init()ed
  * @param {HTMLCanvasElement} [o.canvas]      reuse the preview canvas as the output surface
  * @param {boolean} [o.temporal]              median-smooth the fill while the badge is static
+ * @param {'quality'|'balanced'|'turbo'} [o.speed]  reuse the last fill while the picture around the badge is still
  * @param {(p:{phase:string, value:number, fps:number}) => void} [o.onProgress]
  * @param {(i:{backend:string}) => void} [o.onInfo]
  * @param {AbortSignal} [o.signal]
@@ -174,6 +175,7 @@ async function openSource(file, signal) {
 export async function processVideo(o) {
   const { file, onProgress, onInfo, signal } = o;
   const temporal = o.temporal !== false;
+  const preset = inpainter.SPEED_PRESETS[o.speed] || inpainter.SPEED_PRESETS.balanced;
 
   const muxerMod = await import(MUXER_URL).catch((e) => { throw new Error(`Could not load the MP4 muxer: ${e?.message || e}`); });
   if (typeof VideoEncoder === 'undefined') {
@@ -201,17 +203,24 @@ export async function processVideo(o) {
   const overlay = new OffscreenCanvas(inpainter.SIZE, inpainter.SIZE);
   const overlayCtx = overlay.getContext('2d');
 
+  // Band of pixels just outside the settled mask: if it has not changed since
+  // the last model run, the last fill is still valid and the model is skipped.
+  const band = inpainter.bandIndices(detector.maskSettled, dilate(detector.maskSettled, Math.max(6, Math.round(8 * plan.m))));
+
   /* ---- encoder + muxer ---- */
   const fps = Math.max(1, Math.round(source.fps));
   const bitrate = Math.round(Math.min(18_000_000, Math.max(6_000_000, width * height * fps * 0.09)));
   const candidates = ['avc1.640033', 'avc1.64002a', 'avc1.4d002a', 'avc1.4d0033', 'avc1.42002a'];
   let videoConfig = null;
-  for (const codec of candidates) {
-    const cfg = { codec, width, height, bitrate, framerate: fps, avc: { format: 'avc' } };
-    try {
-      const support = await VideoEncoder.isConfigSupported(cfg);
-      if (support.supported) { videoConfig = support.config || cfg; break; }
-    } catch { /* try the next profile */ }
+  // Hardware encoders are several times faster than the software fallback at 1080x1920.
+  search: for (const hardwareAcceleration of ['prefer-hardware', 'no-preference']) {
+    for (const codec of candidates) {
+      const cfg = { codec, width, height, bitrate, framerate: fps, avc: { format: 'avc' }, hardwareAcceleration };
+      try {
+        const support = await VideoEncoder.isConfigSupported(cfg);
+        if (support.supported) { videoConfig = support.config || cfg; break search; }
+      } catch { /* try the next profile */ }
+    }
   }
   if (!videoConfig) throw new Error('This browser has no H.264 encoder available (WebCodecs).');
 
@@ -237,7 +246,9 @@ export async function processVideo(o) {
   onInfo?.({ backend: `${inpainter.getModelId()} · ${inpainter.getBackend()} · ${videoConfig.codec}` });
 
   /* ---- per-frame work ---- */
-  const stats = { frames: 0, settled: 0, anim: 0, none: 0 };
+  const stats = { frames: 0, settled: 0, anim: 0, none: 0, inferred: 0, reused: 0 };
+  let ref = null;        // window pixels at the last settled model run
+  let reuseAge = 0;      // frames since that run
   const ring = [];
   let lastKey = -Infinity;
   const t0 = performance.now();
@@ -251,22 +262,33 @@ export async function processVideo(o) {
     stats[verdict.state]++;
 
     if (verdict.mask) {
-      let filled = await inpainter.fill(win.data, verdict.mask);
-
-      if (verdict.state === 'settled' && temporal) {
-        ring.push(filled);
-        if (ring.length > 3) ring.shift();
-        if (ring.length === 3 && inpainter.patchMotion(ring[1], ring[2], verdict.mask) < 4) {
-          filled = inpainter.temporalMedian(ring, verdict.mask);
-        }
+      const settled = verdict.state === 'settled';
+      if (settled && ref && inpainter.canReuse(inpainter.bandChange(win.data, ref, band), reuseAge, preset)) {
+        // Nothing moved around the badge: the overlay canvas still holds the right fill.
+        reuseAge++;
+        stats.reused++;
       } else {
-        ring.length = 0;
-      }
+        let filled = await inpainter.fill(win.data, verdict.mask);
+        stats.inferred++;
 
-      overlayCtx.putImageData(new ImageData(inpainter.buildOverlay(filled, verdict.mask), inpainter.SIZE, inpainter.SIZE), 0, 0);
+        if (settled && temporal) {
+          ring.push(filled);
+          if (ring.length > 3) ring.shift();
+          if (ring.length === 3 && inpainter.patchMotion(ring[1], ring[2], verdict.mask) < 4) {
+            filled = inpainter.temporalMedian(ring, verdict.mask);
+          }
+        } else if (!settled) {
+          ring.length = 0;
+        }
+        ref = settled ? win.data : null;
+        reuseAge = 0;
+        overlayCtx.clearRect(0, 0, inpainter.SIZE, inpainter.SIZE);
+        overlayCtx.putImageData(new ImageData(inpainter.buildOverlay(filled, verdict.mask), inpainter.SIZE, inpainter.SIZE), 0, 0);
+      }
       outCtx.drawImage(overlay, 0, 0, inpainter.SIZE, inpainter.SIZE, plan.x, plan.y, plan.win, plan.win);
     } else {
       ring.length = 0;
+      ref = null;
     }
 
     while (encoder.encodeQueueSize > 8 && !encoderError) await sleep(2);

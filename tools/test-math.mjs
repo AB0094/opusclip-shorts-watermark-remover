@@ -14,6 +14,7 @@
 import assert from 'node:assert/strict';
 import {
   buildMIGANInput, buildLamaInputs, chwToRGBA, buildOverlay, temporalMedian, patchMotion, SIZE,
+  bandIndices, bandChange, canReuse, SPEED_PRESETS,
 } from '../static/js/inpainter.js';
 import { planWindow, createDetectorCore, dilate, MODEL_SIZE } from '../static/js/watermark.js';
 import { badgeRect, scaleRect, BADGE_HORIZONTAL, ZONE } from '../static/js/geometry.js';
@@ -313,6 +314,34 @@ test('reset() forgets the settled state', () => {
   det.analyze(withWhite(tH)); det.analyze(withWhite(tH));
   det.reset();
   assert.equal(det.analyze(frame(grey(20))).state, 'none');
+});
+
+/* ---------------------------- fill reuse ---------------------------- */
+
+test('bandIndices is the ring outside the mask, never the mask itself', () => {
+  const m = new Uint8Array(N); m[100 * SIZE + 100] = 1;
+  const band = bandIndices(m, dilate(m, 3));
+  assert.ok(band.length > 10);
+  assert.ok(!band.includes(100 * SIZE + 100));
+});
+
+test('bandChange ignores changes inside the mask and sees changes in the band', () => {
+  const m = new Uint8Array(N); m[100 * SIZE + 100] = 1;
+  const band = bandIndices(m, dilate(m, 3));
+  const a = new Uint8ClampedArray(N * 4).fill(100);
+  const b = new Uint8ClampedArray(a); b[(100 * SIZE + 100) * 4] = 255;
+  assert.equal(bandChange(a, b, band).mean, 0);
+  const c = new Uint8ClampedArray(a); for (const i of band) c[i * 4] = 200;
+  const ch = bandChange(a, c, band);
+  assert.ok(ch.mean > 30 && ch.moved === 1);
+});
+
+test('canReuse: quality never reuses; balanced reuses a still band up to its limit', () => {
+  const still = { mean: 0.5, moved: 0 };
+  assert.equal(canReuse(still, 0, SPEED_PRESETS.quality), false);
+  assert.equal(canReuse(still, 0, SPEED_PRESETS.balanced), true);
+  assert.equal(canReuse(still, SPEED_PRESETS.balanced.maxReuse, SPEED_PRESETS.balanced), false);
+  assert.equal(canReuse({ mean: 20, moved: 0.3 }, 0, SPEED_PRESETS.turbo), false);
 });
 
 console.log(`\n${pass} tests passed\n`);
