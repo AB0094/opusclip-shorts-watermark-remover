@@ -48,10 +48,10 @@
         <path d="M12 16V4m0 0L7 9m5-5 5 5M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"
               fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
       </svg>
-      <p class="dz-title">Drop a short here</p>
+      <p class="dz-title">Drop one or more shorts here</p>
       <p class="dz-sub">MP4 / MOV / WEBM, or a PNG / JPG still — everything stays local</p>
-      <button class="btn btn-primary" id="pick">Choose file</button>
-      <input id="file" type="file" accept="video/*,image/*" hidden />
+      <button class="btn btn-primary" id="pick">Choose files</button>
+      <input id="file" type="file" accept="video/*,image/*" multiple hidden />
     </div>
   </section>
 
@@ -105,6 +105,11 @@
         <p class="muted small" id="model-note"></p>
       </div>
 
+      <div class="queue-wrap" id="queue-wrap" hidden>
+        <p class="queue-head"><span id="queue-count">0 files</span><span class="muted small">one after another</span></p>
+        <ol class="queue" id="queue"></ol>
+      </div>
+
       <div class="progress" id="progress-wrap" hidden>
         <div class="bar"><span id="bar"></span></div>
         <p class="muted" id="progress-text">Preparing…</p>
@@ -113,6 +118,7 @@
       <button class="btn btn-primary btn-wide" id="run">Remove watermark</button>
       <button class="btn btn-ghost btn-wide" id="cancel" hidden>Cancel</button>
       <a class="btn btn-download btn-wide" id="download" hidden download>Download result</a>
+      <button class="btn btn-download btn-wide" id="download-all" hidden>Download all</button>
 
       <p class="note" id="status" role="status"></p>
 

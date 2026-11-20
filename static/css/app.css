@@ -421,3 +421,22 @@ footer a:hover { text-decoration: underline; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* ---- batch queue ---- */
+.queue-wrap { margin-bottom: 14px; }
+.queue-head { display: flex; justify-content: space-between; align-items: baseline; margin: 0 0 6px; font-weight: 600; font-size: 0.9rem; }
+.queue {
+  list-style: none; margin: 0; padding: 0; max-height: 240px; overflow-y: auto;
+  border: 1px solid var(--line); border-radius: 10px;
+}
+.queue li {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; align-items: center;
+  padding: 7px 10px; font-size: 0.82rem; border-bottom: 1px solid var(--line);
+}
+.queue li:last-child { border-bottom: 0; }
+.queue .q-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.queue .q-state { opacity: 0.7; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.queue li.active { background: rgba(124, 92, 255, 0.12); }
+.queue li.done .q-state { opacity: 1; }
+.queue li.failed .q-state { color: var(--error); opacity: 1; }
+.queue a { color: var(--accent); }

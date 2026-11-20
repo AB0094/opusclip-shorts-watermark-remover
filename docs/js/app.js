@@ -24,6 +24,10 @@ const els = {
   run: $('run'),
   cancel: $('cancel'),
   download: $('download'),
+  downloadAll: $('download-all'),
+  queueWrap: $('queue-wrap'),
+  queue: $('queue'),
+  queueCount: $('queue-count'),
   reset: $('reset'),
   progressWrap: $('progress-wrap'),
   bar: $('bar'),
@@ -41,6 +45,7 @@ const state = {
   resultURL: null,
   controller: null,
   loadToken: 0,
+  queue: [],           // batch: [{ file, li, url, filename }]
 };
 
 const ctx = els.preview.getContext('2d');
@@ -83,7 +88,7 @@ els.dropzone.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onPick(); }
 });
 els.file.addEventListener('change', () => {
-  if (els.file.files?.[0]) load(els.file.files[0]);
+  if (els.file.files?.length) loadMany([...els.file.files]);
 });
 
 for (const evt of ['dragenter', 'dragover']) {
@@ -99,14 +104,49 @@ for (const evt of ['dragleave', 'drop']) {
   });
 }
 els.dropzone.addEventListener('drop', (e) => {
-  const f = e.dataTransfer?.files?.[0];
-  if (f) load(f);
+  const files = [...(e.dataTransfer?.files || [])].filter((f) => /^(video|image)\//.test(f.type) || /\.(mp4|mov|m4v|webm|mkv|png|jpe?g)$/i.test(f.name));
+  if (files.length) loadMany(files);
 });
 
 els.reset.addEventListener('click', reset);
 els.showMask.addEventListener('change', paintOutline);
 
 /* ------------------------------ loading ------------------------------ */
+
+/** One file: the usual single flow. Several: preview the first, list them all, run them in turn. */
+async function loadMany(files) {
+  const first = load(files[0]);   // load() resets synchronously, so the queue is set after it
+  if (files.length > 1) setQueue(files);
+  await first;
+  if (files.length > 1) {
+    els.run.textContent = `Remove watermark from all ${files.length}`;
+    setStatus(`${files.length} files queued. They run one after another; the model loads once.`);
+  }
+}
+
+function setQueue(files) {
+  els.queue.textContent = '';
+  state.queue = files.map((file) => {
+    const li = document.createElement('li');
+    const name = document.createElement('span');
+    name.className = 'q-name';
+    name.textContent = file.name;
+    name.title = file.name;
+    const st = document.createElement('span');
+    st.className = 'q-state';
+    st.textContent = 'waiting';
+    li.append(name, st);
+    els.queue.appendChild(li);
+    return { file, li, st, url: null, filename: null };
+  });
+  els.queueCount.textContent = `${files.length} files`;
+  els.queueWrap.hidden = false;
+}
+
+function setItem(item, cls, text) {
+  item.li.className = cls;
+  item.st.textContent = text;
+}
 
 async function load(file) {
   reset();
@@ -284,6 +324,7 @@ els.run.addEventListener('click', async () => {
   els.model.disabled = true;
   els.speed.disabled = true;
   els.download.hidden = true;
+  els.downloadAll.hidden = true;
   els.cancel.hidden = false;
   els.progressWrap.hidden = false;
   state.controller = new AbortController();
@@ -292,10 +333,11 @@ els.run.addEventListener('click', async () => {
     setStatus('Starting the model…');
     await ensureModel();
 
-    if (state.kind === 'image') {
-      await runImage();
+    if (state.queue.length > 1) {
+      await runBatch();
     } else {
-      await runVideo();
+      const r = state.kind === 'image' ? await runImage() : await runVideo();
+      if (r) offerDownload(r.blob, r.filename);
     }
   } catch (err) {
     if (err?.name === 'AbortError') {
@@ -305,11 +347,72 @@ els.run.addEventListener('click', async () => {
       setStatus(err.message || 'Something went wrong.', true);
     }
   } finally {
-    els.run.disabled = false;
+    els.run.disabled = state.queue.length > 1 && state.queue.every((it) => it.url || it.skipped);
     els.model.disabled = false;
     els.speed.disabled = false;
     els.cancel.hidden = true;
     state.controller = null;
+  }
+});
+
+async function runBatch() {
+  const todo = state.queue.filter((it) => !it.url && !it.skipped);
+  let done = state.queue.length - todo.length, failed = 0;
+  for (const item of todo) {
+    if (state.controller.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    const n = state.queue.indexOf(item) + 1;
+    setItem(item, 'active', 'working…');
+    item.li.scrollIntoView({ block: 'nearest' });
+    els.name.textContent = item.file.name;
+    try {
+      state.file = item.file;
+      if (item.file.type.startsWith('image/')) {
+        await loadImage(item.file);
+      } else {
+        state.kind = 'video';
+        els.info.textContent = `file ${n} of ${state.queue.length}`;
+      }
+      const r = state.kind === 'image'
+        ? await runImage()
+        : await runVideo((pct) => { item.st.textContent = `${pct}%`; });
+      if (!r) { item.skipped = true; setItem(item, 'done', 'no badge'); done++; continue; }
+      item.url = URL.createObjectURL(r.blob);
+      item.filename = r.filename;
+      const a = document.createElement('a');
+      a.href = item.url;
+      a.download = r.filename;
+      a.textContent = 'download';
+      setItem(item, 'done', '');
+      item.st.appendChild(a);
+      done++;
+    } catch (err) {
+      if (err?.name === 'AbortError') { setItem(item, '', 'cancelled'); throw err; }
+      console.error(item.file.name, err);
+      setItem(item, 'failed', 'failed');
+      item.st.title = err?.message || String(err);
+      failed++;
+    }
+  }
+  els.bar.style.width = '100%';
+  els.progressText.textContent = 'Batch done';
+  setStatus(`Batch done · ${done} of ${state.queue.length} cleaned${failed ? ` · ${failed} failed (hover for the reason)` : ''}.`, failed > 0 && !done);
+  els.downloadAll.hidden = !state.queue.some((it) => it.url);
+  const left = state.queue.filter((it) => !it.url && !it.skipped).length;
+  els.run.textContent = left ? `Retry ${left} remaining` : 'All done';
+  els.run.disabled = !left;
+}
+
+els.downloadAll.addEventListener('click', async () => {
+  // One click per file; the browser may ask once to allow multiple downloads.
+  for (const it of state.queue) {
+    if (!it.url) continue;
+    const a = document.createElement('a');
+    a.href = it.url;
+    a.download = it.filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    await new Promise((r) => setTimeout(r, 400));
   }
 });
 
@@ -327,7 +430,7 @@ async function runImage() {
     els.bar.style.width = '100%';
     els.progressText.textContent = 'Nothing to remove';
     setStatus('No badge pixels found in the expected corner, so the image was left unchanged.');
-    return;
+    return null;
   }
 
   setStatus('Inpainting…');
@@ -343,10 +446,11 @@ async function runImage() {
   els.bar.style.width = '100%';
   els.progressText.textContent = 'Done';
   setStatus('Done — download the result.');
-  els.preview.toBlob((blob) => offerDownload(blob, `clean-${state.file.name.replace(/\.[^.]+$/, '')}.png`), 'image/png');
+  const blob = await new Promise((r) => els.preview.toBlob(r, 'image/png'));
+  return { blob, filename: `clean-${state.file.name.replace(/\.[^.]+$/, '')}.png` };
 }
 
-async function runVideo() {
+async function runVideo(onPct) {
   setStatus('Processing every frame…');
   els.progressText.textContent = 'Preparing…';
   els.bar.style.width = '0%';
@@ -362,6 +466,7 @@ async function runVideo() {
       const pct = Math.min(99, Math.round(value * 100));
       els.bar.style.width = `${pct}%`;
       els.progressText.textContent = `Frame by frame — ${pct}% · ${fps.toFixed(1)} fps`;
+      onPct?.(pct);
     },
   });
 
@@ -370,7 +475,7 @@ async function runVideo() {
   els.progressText.textContent = 'Done';
   const cleaned = stats.settled + stats.anim;
   setStatus(`Done · ${(blob.size / 1048576).toFixed(1)} MB MP4 · badge removed on ${cleaned} of ${stats.frames} frames (model ran ${stats.inferred}×, reused ${stats.reused}×) · ${audioNote}`);
-  offerDownload(blob, video.outputName(state.file.name));
+  return { blob, filename: video.outputName(state.file.name) };
 }
 
 function offerDownload(blob, filename) {
@@ -403,6 +508,11 @@ function reset() {
   state.kind = null;
   state.image = null;
   state.resultURL = null;
+  for (const it of state.queue) if (it.url) URL.revokeObjectURL(it.url);
+  state.queue = [];
+  els.queue.textContent = '';
+  els.queueWrap.hidden = true;
+  els.downloadAll.hidden = true;
 
   els.studio.hidden = true;
   els.dropzone.hidden = false;
