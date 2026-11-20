@@ -175,12 +175,14 @@ export function chwToRGBA(chw, scale, offset) {
  * outside it, and fully transparent elsewhere. Drawn over the live frame, so
  * everything outside the badge keeps its original pixels.
  */
-export function buildOverlay(filled, mask) {
+export function buildOverlay(filled, mask, box = maskBox(mask)) {
   const W = SIZE;
   const out = new Uint8ClampedArray(N * 4);
-  for (let y = 0; y < W; y++) {
+  if (!box) return out;
+  // Only the mask's bounding box (+1 px) can be non-transparent.
+  for (let y = box.y0; y <= box.y1; y++) {
     const y0 = y > 0 ? y - 1 : 0, y1 = y < W - 1 ? y + 1 : y;
-    for (let x = 0; x < W; x++) {
+    for (let x = box.x0; x <= box.x1; x++) {
       const x0 = x > 0 ? x - 1 : 0, x1 = x < W - 1 ? x + 1 : x;
       const i = y * W + x;
       // 3x3 box blur of the binary mask, boosted so the interior stays opaque
@@ -197,6 +199,30 @@ export function buildOverlay(filled, mask) {
     }
   }
   return out;
+}
+
+const boxCache = new WeakMap();
+
+/**
+ * Bounding box of a mask grown by 1 px (the overlay's feather), clamped to the
+ * window, or null for an empty mask. Cached per mask object, so the constant
+ * settled mask is scanned once.
+ */
+export function maskBox(mask) {
+  if (boxCache.has(mask)) return boxCache.get(mask);
+  const W = SIZE;
+  let x0 = W, y0 = W, x1 = -1, y1 = -1;
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i]) continue;
+    const x = i % W, y = (i / W) | 0;
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+  }
+  const box = x1 < 0 ? null : {
+    x0: Math.max(0, x0 - 1), y0: Math.max(0, y0 - 1), x1: Math.min(W - 1, x1 + 1), y1: Math.min(W - 1, y1 + 1),
+  };
+  boxCache.set(mask, box);
+  return box;
 }
 
 /**

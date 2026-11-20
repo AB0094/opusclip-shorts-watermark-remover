@@ -14,7 +14,7 @@
 import assert from 'node:assert/strict';
 import {
   buildMIGANInput, buildLamaInputs, chwToRGBA, buildOverlay, temporalMedian, patchMotion, SIZE,
-  bandIndices, bandChange, canReuse, SPEED_PRESETS,
+  bandIndices, bandChange, maskBox, canReuse, SPEED_PRESETS,
 } from '../static/js/inpainter.js';
 import { planWindow, createDetectorCore, dilate, MODEL_SIZE } from '../static/js/watermark.js';
 import { badgeRect, scaleRect, BADGE_HORIZONTAL, ZONE } from '../static/js/geometry.js';
@@ -314,6 +314,19 @@ test('reset() forgets the settled state', () => {
   det.analyze(withWhite(tH)); det.analyze(withWhite(tH));
   det.reset();
   assert.equal(det.analyze(frame(grey(20))).state, 'none');
+});
+
+test('buildOverlay limited to the mask box matches a full-window scan', () => {
+  const m = new Uint8Array(N);
+  for (let y = 40; y < 60; y++) for (let x = 300; x < 340; x++) m[y * SIZE + x] = 1;
+  m[0] = 1; m[N - 1] = 1;   // corners: box clamps to the window
+  const filled = new Uint8ClampedArray(N * 4).map((_, i) => i * 7);
+  const full = buildOverlay(filled, m, { x0: 0, y0: 0, x1: SIZE - 1, y1: SIZE - 1 });
+  assert.deepEqual(buildOverlay(filled, m), full);
+  const m2 = new Uint8Array(N); for (let y = 40; y < 60; y++) for (let x = 300; x < 340; x++) m2[y * SIZE + x] = 1;
+  assert.deepEqual(maskBox(m2), { x0: 299, y0: 39, x1: 340, y1: 60 });
+  assert.deepEqual(buildOverlay(filled, m2), buildOverlay(filled, m2, { x0: 0, y0: 0, x1: SIZE - 1, y1: SIZE - 1 }));
+  assert.equal(maskBox(new Uint8Array(N)), null);
 });
 
 /* ---------------------------- fill reuse ---------------------------- */

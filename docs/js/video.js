@@ -146,6 +146,7 @@ async function openSource(file, signal) {
           fps: src.fps,
           total: src.video.samples.length,
           frames: webcodecsFrames(src, cfg, signal),
+          pipelined: true,
           audio: src.audio,
         };
       }
@@ -253,42 +254,71 @@ export async function processVideo(o) {
   let lastKey = -Infinity;
   const t0 = performance.now();
 
-  async function handle(item) {
-    outCtx.drawImage(item.draw, 0, 0, width, height);
+  // The model runs one job at a time, but the CPU work around it (decode, read
+  // the window, detect, composite, encode) overlaps with it: while the GPU fills
+  // frame N, frame N+1 is already read and detected and its job is queued, so
+  // the GPU goes straight on to it. Frames are still composited and encoded
+  // strictly in order, and every fill belongs to its own frame.
+  let gpuChain = Promise.resolve();
+  const runModel = (rgba, mask) => {
+    const job = gpuChain.then(() => inpainter.fill(rgba, mask));
+    gpuChain = job.catch(() => {});
+    return job;
+  };
 
+  /** Stage 1 (in order): read the badge window, detect, decide infer / reuse / skip. */
+  function prepare(item) {
     winCtx.drawImage(item.draw, plan.x, plan.y, plan.win, plan.win, 0, 0, inpainter.SIZE, inpainter.SIZE);
     const win = winCtx.getImageData(0, 0, inpainter.SIZE, inpainter.SIZE);
     const verdict = detector.analyze(win.data);
     stats[verdict.state]++;
 
+    let job = null;               // 'reuse' | Promise<filled> | null
     if (verdict.mask) {
       const settled = verdict.state === 'settled';
       if (settled && ref && inpainter.canReuse(inpainter.bandChange(win.data, ref, band), reuseAge, preset)) {
-        // Nothing moved around the badge: the overlay canvas still holds the right fill.
         reuseAge++;
         stats.reused++;
+        job = 'reuse';
       } else {
-        let filled = await inpainter.fill(win.data, verdict.mask);
+        job = runModel(win.data, verdict.mask);
+        job.catch(() => {});      // surfaced in finish(); avoid an unhandled-rejection warning meanwhile
         stats.inferred++;
+        ref = settled ? win.data : null;
+        reuseAge = 0;
+      }
+    } else {
+      ref = null;
+    }
+    return { item, verdict, job };
+  }
 
-        if (settled && temporal) {
+  /** Stage 2 (in order): composite the fill over the frame and encode it. */
+  async function finish({ item, verdict, job }) {
+    let filled = null;
+    if (job && job !== 'reuse') filled = await job;
+
+    outCtx.drawImage(item.draw, 0, 0, width, height);
+    if (verdict.mask) {
+      if (filled) {
+        if (verdict.state === 'settled' && temporal) {
           ring.push(filled);
           if (ring.length > 3) ring.shift();
           if (ring.length === 3 && inpainter.patchMotion(ring[1], ring[2], verdict.mask) < 4) {
             filled = inpainter.temporalMedian(ring, verdict.mask);
           }
-        } else if (!settled) {
+        } else if (verdict.state !== 'settled') {
           ring.length = 0;
         }
-        ref = settled ? win.data : null;
-        reuseAge = 0;
+        const box = inpainter.maskBox(verdict.mask);
         overlayCtx.clearRect(0, 0, inpainter.SIZE, inpainter.SIZE);
-        overlayCtx.putImageData(new ImageData(inpainter.buildOverlay(filled, verdict.mask), inpainter.SIZE, inpainter.SIZE), 0, 0);
+        overlayCtx.putImageData(new ImageData(inpainter.buildOverlay(filled, verdict.mask, box), inpainter.SIZE, inpainter.SIZE),
+          0, 0, box.x0, box.y0, box.x1 - box.x0 + 1, box.y1 - box.y0 + 1);
       }
+      // 'reuse': the overlay canvas still holds the last fill, which is still right.
       outCtx.drawImage(overlay, 0, 0, inpainter.SIZE, inpainter.SIZE, plan.x, plan.y, plan.win, plan.win);
     } else {
       ring.length = 0;
-      ref = null;
     }
 
     while (encoder.encodeQueueSize > 8 && !encoderError) await sleep(2);
@@ -300,23 +330,38 @@ export async function processVideo(o) {
     encoder.encode(frame, { keyFrame });
     frame.close();
     stats.frames++;
+    if (stats.frames % 4 === 0 || stats.frames === source.total) {
+      const secs = (performance.now() - t0) / 1000;
+      onProgress?.({ phase: 'encoding', value: stats.frames / (source.total || 1), fps: stats.frames / Math.max(secs, 0.001) });
+    }
   }
 
+  // Frames from the <video> fallback share one element, so they cannot be held
+  // while the next one is read: that path stays one frame at a time.
+  const depth = source.pipelined ? 2 : 0;
+  const pending = [];
   try {
     for await (const item of source.frames) {
       try {
-        await handle(item);
-      } finally {
+        pending.push(prepare(item));
+      } catch (e) {
         item.close();
+        throw e;
       }
-      if (stats.frames % 4 === 0 || stats.frames === source.total) {
-        const secs = (performance.now() - t0) / 1000;
-        onProgress?.({ phase: 'encoding', value: stats.frames / (source.total || 1), fps: stats.frames / Math.max(secs, 0.001) });
+      while (pending.length > depth) {
+        const p = pending.shift();
+        try { await finish(p); } finally { p.item.close(); }
       }
+    }
+    while (pending.length) {
+      const p = pending.shift();
+      try { await finish(p); } finally { p.item.close(); }
     }
     if (encoderError) throw encoderError;
     await encoder.flush();
   } finally {
+    for (const p of pending) p.item.close();
+    pending.length = 0;
     try { if (encoder.state !== 'closed') encoder.close(); } catch { /* noop */ }
   }
 

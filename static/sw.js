@@ -10,7 +10,7 @@
  * untouched.
  */
 
-const CACHE = 'opusclip-remover-v9';
+const CACHE = 'opusclip-remover-v10';
 
 const SHELL = [
   './',
