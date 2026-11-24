@@ -3,6 +3,7 @@ import * as video from './video.js';
 import { MODELS } from './model-cache.js';
 import { createDetector } from './watermark.js';
 import { badgeRect } from './geometry.js';
+import { buildSlots } from './video.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -18,6 +19,10 @@ const els = {
   outline: $('badge-outline'),
   showMask: $('show-mask'),
   temporal: $('temporal'),
+  badgeAuto: $('badge-auto'),
+  markArea: $('mark-area'),
+  areasList: $('areas-list'),
+  areaLayer: $('area-layer'),
   speed: $('speed'),
   model: $('model'),
   modelNote: $('model-note'),
@@ -45,6 +50,8 @@ const state = {
   resultURL: null,
   controller: null,
   loadToken: 0,
+  areas: [],           // user-marked areas, frame fractions {x,y,w,h}; kept across files
+  drawing: false,
   queue: [],           // batch: [{ file, li, url, filename }]
 };
 
@@ -267,6 +274,7 @@ function reportDetection(kind) {
 /* ------------------------------ preview ------------------------------ */
 
 function paintOutline() {
+  renderAreas();
   const on = els.showMask.checked;
   els.outline.hidden = !on;
   if (!on) return;
@@ -292,6 +300,99 @@ function paintOutline() {
 
 window.addEventListener('resize', paintOutline);
 if ('ResizeObserver' in window) new ResizeObserver(paintOutline).observe(els.wrap);
+
+/* ---------------------------- extra areas ---------------------------- */
+
+try { state.areas = JSON.parse(localStorage.getItem('opusclip-areas') || '[]').filter((r) => r && r.w > 0 && r.h > 0); } catch { state.areas = []; }
+try { els.badgeAuto.checked = localStorage.getItem('opusclip-badge') !== 'off'; } catch { /* storage blocked */ }
+els.badgeAuto.addEventListener('change', () => {
+  try { localStorage.setItem('opusclip-badge', els.badgeAuto.checked ? 'on' : 'off'); } catch { /* storage blocked */ }
+});
+
+function saveAreas() {
+  try { localStorage.setItem('opusclip-areas', JSON.stringify(state.areas)); } catch { /* storage blocked */ }
+  renderAreas();
+}
+
+/** Canvas rect relative to the wrap, in CSS px. */
+function canvasBox() {
+  const cr = els.preview.getBoundingClientRect();
+  const wr = els.wrap.getBoundingClientRect();
+  return { left: cr.left - wr.left, top: cr.top - wr.top, width: cr.width, height: cr.height, cr };
+}
+
+function renderAreas(draft) {
+  els.areaLayer.textContent = '';
+  els.areasList.textContent = '';
+  const b = canvasBox();
+  const all = draft ? [...state.areas, draft] : state.areas;
+  all.forEach((r, i) => {
+    if (b.width) {
+      const d = document.createElement('div');
+      d.className = 'area-box';
+      d.style.left = `${b.left + r.x * b.width}px`;
+      d.style.top = `${b.top + r.y * b.height}px`;
+      d.style.width = `${r.w * b.width}px`;
+      d.style.height = `${r.h * b.height}px`;
+      const tag = document.createElement('span');
+      tag.textContent = r === draft ? 'new area' : `area ${i + 1}`;
+      d.appendChild(tag);
+      els.areaLayer.appendChild(d);
+    }
+    if (r === draft) return;
+    const li = document.createElement('li');
+    const w = els.preview.width, h = els.preview.height;
+    li.textContent = w ? `Area ${i + 1} · ${Math.round(r.w * w)} × ${Math.round(r.h * h)} px` : `Area ${i + 1}`;
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.title = 'Remove this area';
+    x.textContent = '✕';
+    x.addEventListener('click', () => { state.areas.splice(i, 1); saveAreas(); });
+    li.appendChild(x);
+    els.areasList.appendChild(li);
+  });
+}
+
+function setDrawing(on) {
+  state.drawing = on;
+  els.wrap.classList.toggle('drawing', on);
+  els.markArea.classList.toggle('on', on);
+  els.markArea.textContent = on ? 'Drag on the preview… (Esc)' : '+ Mark area';
+}
+els.markArea.addEventListener('click', () => setDrawing(!state.drawing));
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && state.drawing) setDrawing(false); });
+
+let drag = null;
+const frac = (e) => {
+  const { cr } = canvasBox();
+  return {
+    x: Math.min(1, Math.max(0, (e.clientX - cr.left) / cr.width)),
+    y: Math.min(1, Math.max(0, (e.clientY - cr.top) / cr.height)),
+  };
+};
+els.wrap.addEventListener('pointerdown', (e) => {
+  if (!state.drawing || !els.preview.width) return;
+  e.preventDefault();
+  els.wrap.setPointerCapture(e.pointerId);
+  drag = frac(e);
+});
+els.wrap.addEventListener('pointermove', (e) => {
+  if (!drag) return;
+  const p = frac(e);
+  renderAreas({ x: Math.min(drag.x, p.x), y: Math.min(drag.y, p.y), w: Math.abs(p.x - drag.x), h: Math.abs(p.y - drag.y) });
+});
+els.wrap.addEventListener('pointerup', (e) => {
+  if (!drag) return;
+  const p = frac(e);
+  const r = { x: Math.min(drag.x, p.x), y: Math.min(drag.y, p.y), w: Math.abs(p.x - drag.x), h: Math.abs(p.y - drag.y) };
+  drag = null;
+  if (r.w * els.preview.width >= 4 && r.h * els.preview.height >= 4) state.areas.push(r);
+  setDrawing(false);
+  saveAreas();
+});
+window.addEventListener('resize', () => renderAreas());
+if ('ResizeObserver' in window) new ResizeObserver(() => renderAreas()).observe(els.wrap);
+renderAreas();
 
 /* ------------------------------- run -------------------------------- */
 
@@ -323,6 +424,9 @@ els.run.addEventListener('click', async () => {
   els.run.disabled = true;
   els.model.disabled = true;
   els.speed.disabled = true;
+  els.badgeAuto.disabled = true;
+  els.markArea.disabled = true;
+  setDrawing(false);
   els.download.hidden = true;
   els.downloadAll.hidden = true;
   els.cancel.hidden = false;
@@ -350,6 +454,8 @@ els.run.addEventListener('click', async () => {
     els.run.disabled = state.queue.length > 1 && state.queue.every((it) => it.url || it.skipped);
     els.model.disabled = false;
     els.speed.disabled = false;
+    els.badgeAuto.disabled = false;
+    els.markArea.disabled = false;
     els.cancel.hidden = true;
     state.controller = null;
   }
@@ -420,28 +526,33 @@ els.cancel.addEventListener('click', () => state.controller?.abort());
 
 async function runImage() {
   const w = els.preview.width, h = els.preview.height;
-  const detector = await createDetector(w, h);
-  const { plan } = detector;
-
+  const slots = await buildSlots(w, h, { badge: els.badgeAuto.checked, areas: state.areas });
   ctx.putImageData(state.image, 0, 0);
-  const win = windowPixels(els.preview, detector);
-  const verdict = detector.analyze(win.data, { still: true });
-  if (!verdict.mask) {
+
+  // Read every window from the untouched image first, then fill and composite.
+  const jobs = slots.map((slot) => {
+    const { plan } = slot;
+    slot.winCtx.drawImage(els.preview, plan.x, plan.y, plan.win, plan.win, 0, 0, inpainter.SIZE, inpainter.SIZE);
+    const win = slot.winCtx.getImageData(0, 0, inpainter.SIZE, inpainter.SIZE);
+    return { slot, win, verdict: slot.analyze(win.data, { still: true }) };
+  }).filter((j) => j.verdict.mask);
+
+  if (!jobs.length) {
     els.bar.style.width = '100%';
     els.progressText.textContent = 'Nothing to remove';
-    setStatus('No badge pixels found in the expected corner, so the image was left unchanged.');
+    setStatus('No badge found and no areas marked, so the image was left unchanged.');
     return null;
   }
 
   setStatus('Inpainting…');
   els.bar.style.width = '35%';
-  const filled = await inpainter.fill(win.data, verdict.mask);
-
-  const overlay = new OffscreenCanvas(inpainter.SIZE, inpainter.SIZE);
-  overlay.getContext('2d').putImageData(
-    new ImageData(inpainter.buildOverlay(filled, verdict.mask), inpainter.SIZE, inpainter.SIZE), 0, 0);
-  ctx.imageSmoothingEnabled = plan.win !== inpainter.SIZE;
-  ctx.drawImage(overlay, 0, 0, inpainter.SIZE, inpainter.SIZE, plan.x, plan.y, plan.win, plan.win);
+  for (const { slot, win, verdict } of jobs) {
+    const filled = await inpainter.fill(win.data, verdict.mask);
+    slot.overlayCtx.putImageData(
+      new ImageData(inpainter.buildOverlay(filled, verdict.mask), inpainter.SIZE, inpainter.SIZE), 0, 0);
+    ctx.imageSmoothingEnabled = slot.plan.win !== inpainter.SIZE;
+    ctx.drawImage(slot.overlay, 0, 0, inpainter.SIZE, inpainter.SIZE, slot.plan.x, slot.plan.y, slot.plan.win, slot.plan.win);
+  }
 
   els.bar.style.width = '100%';
   els.progressText.textContent = 'Done';
@@ -460,6 +571,8 @@ async function runVideo(onPct) {
     canvas: els.preview,
     temporal: els.temporal.checked,
     speed: els.speed.value,
+    badge: els.badgeAuto.checked,
+    areas: state.areas,
     signal: state.controller.signal,
     onInfo: ({ backend }) => { els.backend.textContent = backend; },
     onProgress: ({ value, fps }) => {
@@ -474,7 +587,11 @@ async function runVideo(onPct) {
   els.bar.style.width = '100%';
   els.progressText.textContent = 'Done';
   const cleaned = stats.settled + stats.anim;
-  setStatus(`Done · ${(blob.size / 1048576).toFixed(1)} MB MP4 · badge removed on ${cleaned} of ${stats.frames} frames (model ran ${stats.inferred}×, reused ${stats.reused}×) · ${audioNote}`);
+  const what = [
+    els.badgeAuto.checked ? `badge removed on ${cleaned} of ${stats.frames} frames` : null,
+    state.areas.length ? `${state.areas.length} marked area${state.areas.length > 1 ? 's' : ''} filled` : null,
+  ].filter(Boolean).join(' · ');
+  setStatus(`Done · ${(blob.size / 1048576).toFixed(1)} MB MP4 · ${what} (model ran ${stats.inferred}×, reused ${stats.reused}×) · ${audioNote}`);
   return { blob, filename: video.outputName(state.file.name) };
 }
 

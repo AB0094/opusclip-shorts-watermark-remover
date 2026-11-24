@@ -10,7 +10,7 @@
  * untouched.
  */
 
-const CACHE = 'opusclip-remover-v11';
+const CACHE = 'opusclip-remover-v12';
 
 const SHELL = [
   './',
@@ -23,6 +23,7 @@ const SHELL = [
   'js/model-cache.js',
   'js/demux.js',
   'js/video.js',
+  'js/regions.js',
   'js/coi-bootstrap.js',
   'assets/wm-horizontal.png',
   'assets/wm-vertical.png',

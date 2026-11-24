@@ -74,6 +74,7 @@
       <div class="canvas-wrap" id="canvas-wrap">
         <canvas id="preview"></canvas>
         <div class="badge-outline" id="badge-outline" hidden></div>
+        <div class="area-layer" id="area-layer"></div>
       </div>
 
       <div class="detect" id="detect-line">
@@ -86,6 +87,18 @@
       <h2>Run</h2>
 
       <div class="control-block">
+        <label class="switch">
+          <input type="checkbox" id="badge-auto" checked />
+          <span>Remove OpusClip badge <em>found automatically</em></span>
+        </label>
+        <div class="areas">
+          <div class="areas-head">
+            <span>Extra areas</span>
+            <button class="btn btn-ghost btn-sm" id="mark-area" type="button">+ Mark area</button>
+          </div>
+          <p class="muted small" id="areas-hint">Your own logo, a caption or a sticker: drag a box over it on the preview. The same areas apply to every file.</p>
+          <ol class="areas-list" id="areas-list"></ol>
+        </div>
         <label class="switch">
           <input type="checkbox" id="temporal" checked />
           <span>Temporal smoothing <em>reduces shimmer on hair</em></span>

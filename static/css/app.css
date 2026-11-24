@@ -440,3 +440,26 @@ footer a:hover { text-decoration: underline; }
 .queue li.done .q-state { opacity: 1; }
 .queue li.failed .q-state { color: var(--error); opacity: 1; }
 .queue a { color: var(--accent); }
+
+/* ---- user-marked areas ---- */
+.areas { margin: 4px 0 12px; }
+.areas-head { display: flex; justify-content: space-between; align-items: center; font-size: 0.9rem; }
+.btn-sm { padding: 4px 10px; font-size: 0.8rem; }
+.btn-sm.on { background: rgba(255, 170, 60, 0.18); border-color: rgba(255, 170, 60, 0.7); }
+.areas-list { list-style: none; margin: 6px 0 0; padding: 0; }
+.areas-list li { display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; padding: 3px 0; }
+.areas-list button { background: none; border: 0; color: var(--error); cursor: pointer; font-size: 0.9rem; }
+.area-layer { position: absolute; inset: 0; pointer-events: none; }
+.canvas-wrap.drawing { cursor: crosshair; touch-action: none; }
+.canvas-wrap.drawing .area-layer { pointer-events: none; }
+.area-box {
+  position: absolute; border: 1.5px dashed rgba(255, 170, 60, 0.95);
+  background: rgba(255, 170, 60, 0.16); border-radius: 3px;
+}
+.area-box span {
+  position: absolute; left: 0; top: -18px; font-size: 10.5px; padding: 1px 5px;
+  background: rgba(12, 10, 24, 0.9); color: #ffd7a0; border-radius: 3px;
+}
+
+/* The [hidden] attribute must win over .btn and other display rules. */
+[hidden] { display: none !important; }

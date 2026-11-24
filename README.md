@@ -64,6 +64,13 @@ MP4 ──mp4box──► samples ──VideoDecoder──► frame
   this typically cuts model runs by 3 to 6 times, and the model is almost all of
   the processing time.
 - **Hardware H.264 encoding** is requested first, with software as the fallback.
+- **Extra areas.** Drag boxes on the preview over anything else you want gone
+  (your own logo, a caption, a sticker). Each area gets its own model window and
+  is filled on every frame, with the same fill reuse as the badge. Areas are
+  stored as fractions of the frame, so one set applies to every file in a batch.
+  The automatic OpusClip removal can be switched off to use areas only.
+- **Batch mode.** Pick or drop several files; they run one after another with the
+  model loaded once, each with its own download link, plus *Download all*.
 - **Temporal smoothing** (optional): median of the last 3 fills while the badge is
   static and the picture under it is not moving.
 

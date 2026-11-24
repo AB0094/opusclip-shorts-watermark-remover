@@ -17,6 +17,7 @@ import {
   bandIndices, bandChange, maskBox, canReuse, SPEED_PRESETS,
 } from '../static/js/inpainter.js';
 import { planWindow, createDetectorCore, dilate, MODEL_SIZE } from '../static/js/watermark.js';
+import { planArea, toPixels } from '../static/js/regions.js';
 import { badgeRect, scaleRect, BADGE_HORIZONTAL, ZONE } from '../static/js/geometry.js';
 
 let pass = 0;
@@ -327,6 +328,27 @@ test('buildOverlay limited to the mask box matches a full-window scan', () => {
   assert.deepEqual(maskBox(m2), { x0: 299, y0: 39, x1: 340, y1: 60 });
   assert.deepEqual(buildOverlay(filled, m2), buildOverlay(filled, m2, { x0: 0, y0: 0, x1: SIZE - 1, y1: SIZE - 1 }));
   assert.equal(maskBox(new Uint8Array(N)), null);
+});
+
+/* ---------------------------- user areas ---------------------------- */
+
+test('planArea: a small area gets a 512 window that contains it, mask covers it', () => {
+  const p = planArea({ x: 0.8, y: 0.9, w: 0.1, h: 0.03 }, 1080, 1920);
+  assert.equal(p.win, 512);
+  assert.ok(p.x >= 0 && p.x + p.win <= 1080 && p.y >= 0 && p.y + p.win <= 1920);
+  const px = toPixels({ x: 0.8, y: 0.9, w: 0.1, h: 0.03 }, 1080, 1920);
+  for (const [fx, fy] of [[px.x, px.y], [px.x + px.w - 1, px.y + px.h - 1]]) {
+    const mx = Math.floor((fx - p.x) * p.k), my = Math.floor((fy - p.y) * p.k);
+    assert.equal(p.mask[my * 512 + mx], 1);
+  }
+  assert.equal(p.mask[0], 0);
+});
+
+test('planArea: a big area gets a bigger window scaled to 512; degenerate areas are ignored', () => {
+  const p = planArea({ x: 0, y: 0.4, w: 1, h: 0.2 }, 1080, 1920);
+  assert.equal(p.win, 1080);
+  assert.ok(p.k < 1);
+  assert.equal(planArea({ x: 0.5, y: 0.5, w: 0, h: 0.1 }, 1080, 1920), null);
 });
 
 /* ---------------------------- fill reuse ---------------------------- */

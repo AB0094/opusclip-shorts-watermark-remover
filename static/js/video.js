@@ -22,6 +22,7 @@
 import { createDetector, dilate } from './watermark.js';
 import * as inpainter from './inpainter.js';
 import { demux } from './demux.js';
+import { planArea } from './regions.js';
 
 const MUXER_URL = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.1/build/mp4-muxer.mjs';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -169,6 +170,8 @@ async function openSource(file, signal) {
  * @param {HTMLCanvasElement} [o.canvas]      reuse the preview canvas as the output surface
  * @param {boolean} [o.temporal]              median-smooth the fill while the badge is static
  * @param {'quality'|'balanced'|'turbo'} [o.speed]  reuse the last fill while the picture around the badge is still
+ * @param {boolean} [o.badge]                 auto-remove the OpusClip badge (default true)
+ * @param {{x:number,y:number,w:number,h:number}[]} [o.areas]  extra user-marked areas, as frame fractions
  * @param {(p:{phase:string, value:number, fps:number}) => void} [o.onProgress]
  * @param {(i:{backend:string}) => void} [o.onInfo]
  * @param {AbortSignal} [o.signal]
@@ -195,18 +198,8 @@ export async function processVideo(o) {
   outCtx.fillStyle = '#000';
   outCtx.fillRect(0, 0, width, height);
 
-  const detector = await createDetector(width, height);
-  const { plan } = detector;
-  outCtx.imageSmoothingEnabled = plan.win !== inpainter.SIZE;
-
-  const winCanvas = new OffscreenCanvas(inpainter.SIZE, inpainter.SIZE);
-  const winCtx = winCanvas.getContext('2d', { willReadFrequently: true });
-  const overlay = new OffscreenCanvas(inpainter.SIZE, inpainter.SIZE);
-  const overlayCtx = overlay.getContext('2d');
-
-  // Band of pixels just outside the settled mask: if it has not changed since
-  // the last model run, the last fill is still valid and the model is skipped.
-  const band = inpainter.bandIndices(detector.maskSettled, dilate(detector.maskSettled, Math.max(6, Math.round(8 * plan.m))));
+  const slots = await buildSlots(width, height, { badge: o.badge !== false, areas: o.areas || [] });
+  if (!slots.length) throw new Error('Nothing to remove: the OpusClip badge is off and no areas are marked.');
 
   /* ---- encoder + muxer ---- */
   const fps = Math.max(1, Math.round(source.fps));
@@ -248,17 +241,14 @@ export async function processVideo(o) {
 
   /* ---- per-frame work ---- */
   const stats = { frames: 0, settled: 0, anim: 0, none: 0, inferred: 0, reused: 0 };
-  let ref = null;        // window pixels at the last settled model run
-  let reuseAge = 0;      // frames since that run
-  const ring = [];
   let lastKey = -Infinity;
   const t0 = performance.now();
 
   // The model runs one job at a time, but the CPU work around it (decode, read
-  // the window, detect, composite, encode) overlaps with it: while the GPU fills
-  // frame N, frame N+1 is already read and detected and its job is queued, so
-  // the GPU goes straight on to it. Frames are still composited and encoded
-  // strictly in order, and every fill belongs to its own frame.
+  // the windows, detect, composite, encode) overlaps with it: while the GPU
+  // fills frame N, frame N+1 is already read and its jobs are queued, so the
+  // GPU goes straight on. Frames are still composited and encoded strictly in
+  // order, and every fill belongs to its own frame.
   let gpuChain = Promise.resolve();
   const runModel = (rgba, mask) => {
     const job = gpuChain.then(() => inpainter.fill(rgba, mask));
@@ -266,60 +256,66 @@ export async function processVideo(o) {
     return job;
   };
 
-  /** Stage 1 (in order): read the badge window, detect, decide infer / reuse / skip. */
+  /** Stage 1 (in order): per slot, read the window, detect, decide infer / reuse / skip. */
   function prepare(item) {
-    winCtx.drawImage(item.draw, plan.x, plan.y, plan.win, plan.win, 0, 0, inpainter.SIZE, inpainter.SIZE);
-    const win = winCtx.getImageData(0, 0, inpainter.SIZE, inpainter.SIZE);
-    const verdict = detector.analyze(win.data);
-    stats[verdict.state]++;
+    const parts = slots.map((slot) => {
+      const { plan } = slot;
+      slot.winCtx.drawImage(item.draw, plan.x, plan.y, plan.win, plan.win, 0, 0, inpainter.SIZE, inpainter.SIZE);
+      const win = slot.winCtx.getImageData(0, 0, inpainter.SIZE, inpainter.SIZE);
+      const verdict = slot.analyze(win.data);
+      if (slot.detector) stats[verdict.state]++;
 
-    let job = null;               // 'reuse' | Promise<filled> | null
-    if (verdict.mask) {
-      const settled = verdict.state === 'settled';
-      if (settled && ref && inpainter.canReuse(inpainter.bandChange(win.data, ref, band), reuseAge, preset)) {
-        reuseAge++;
-        stats.reused++;
-        job = 'reuse';
+      let job = null;               // 'reuse' | Promise<filled> | null
+      if (verdict.mask) {
+        const settled = verdict.state === 'settled';
+        if (settled && slot.ref && inpainter.canReuse(inpainter.bandChange(win.data, slot.ref, slot.band), slot.reuseAge, preset)) {
+          slot.reuseAge++;
+          stats.reused++;
+          job = 'reuse';
+        } else {
+          job = runModel(win.data, verdict.mask);
+          job.catch(() => {});      // surfaced in finish()
+          stats.inferred++;
+          slot.ref = settled ? win.data : null;
+          slot.reuseAge = 0;
+        }
       } else {
-        job = runModel(win.data, verdict.mask);
-        job.catch(() => {});      // surfaced in finish(); avoid an unhandled-rejection warning meanwhile
-        stats.inferred++;
-        ref = settled ? win.data : null;
-        reuseAge = 0;
+        slot.ref = null;
       }
-    } else {
-      ref = null;
-    }
-    return { item, verdict, job };
+      return { slot, verdict, job };
+    });
+    return { item, parts };
   }
 
-  /** Stage 2 (in order): composite the fill over the frame and encode it. */
-  async function finish({ item, verdict, job }) {
-    let filled = null;
-    if (job && job !== 'reuse') filled = await job;
+  /** Stage 2 (in order): composite every fill over the frame and encode it. */
+  async function finish({ item, parts }) {
+    const fills = [];
+    for (const p of parts) fills.push(p.job && p.job !== 'reuse' ? await p.job : null);
 
     outCtx.drawImage(item.draw, 0, 0, width, height);
-    if (verdict.mask) {
+    parts.forEach(({ slot, verdict }, idx) => {
+      let filled = fills[idx];
+      if (!verdict.mask) { slot.ring.length = 0; return; }
       if (filled) {
         if (verdict.state === 'settled' && temporal) {
-          ring.push(filled);
-          if (ring.length > 3) ring.shift();
-          if (ring.length === 3 && inpainter.patchMotion(ring[1], ring[2], verdict.mask) < 4) {
-            filled = inpainter.temporalMedian(ring, verdict.mask);
+          slot.ring.push(filled);
+          if (slot.ring.length > 3) slot.ring.shift();
+          if (slot.ring.length === 3 && inpainter.patchMotion(slot.ring[1], slot.ring[2], verdict.mask) < 4) {
+            filled = inpainter.temporalMedian(slot.ring, verdict.mask);
           }
         } else if (verdict.state !== 'settled') {
-          ring.length = 0;
+          slot.ring.length = 0;
         }
         const box = inpainter.maskBox(verdict.mask);
-        overlayCtx.clearRect(0, 0, inpainter.SIZE, inpainter.SIZE);
-        overlayCtx.putImageData(new ImageData(inpainter.buildOverlay(filled, verdict.mask, box), inpainter.SIZE, inpainter.SIZE),
+        slot.overlayCtx.clearRect(0, 0, inpainter.SIZE, inpainter.SIZE);
+        slot.overlayCtx.putImageData(new ImageData(inpainter.buildOverlay(filled, verdict.mask, box), inpainter.SIZE, inpainter.SIZE),
           0, 0, box.x0, box.y0, box.x1 - box.x0 + 1, box.y1 - box.y0 + 1);
       }
-      // 'reuse': the overlay canvas still holds the last fill, which is still right.
-      outCtx.drawImage(overlay, 0, 0, inpainter.SIZE, inpainter.SIZE, plan.x, plan.y, plan.win, plan.win);
-    } else {
-      ring.length = 0;
-    }
+      // 'reuse': the slot's overlay canvas still holds its last fill, which is still right.
+      const { plan } = slot;
+      outCtx.imageSmoothingEnabled = plan.win !== inpainter.SIZE;
+      outCtx.drawImage(slot.overlay, 0, 0, inpainter.SIZE, inpainter.SIZE, plan.x, plan.y, plan.win, plan.win);
+    });
 
     while (encoder.encodeQueueSize > 8 && !encoderError) await sleep(2);
     if (encoderError) throw encoderError;
@@ -384,6 +380,40 @@ export async function processVideo(o) {
   const blob = new Blob([target.buffer], { type: 'video/mp4' });
   console.log(`[video] ${videoConfig.codec}, ${(blob.size / 1048576).toFixed(1)} MB, ${audioNote}`, stats);
   return { blob, mimeType: 'video/mp4', width, height, fps, stats, audioNote };
+}
+
+/**
+ * One "slot" per thing to remove: the OpusClip badge (found per frame by the
+ * detector) and each user-marked area (a fixed mask, treated as always settled
+ * so fill reuse applies to it too). Each slot has its own model window, reuse
+ * state and overlay.
+ */
+export async function buildSlots(width, height, { badge = true, areas = [] } = {}) {
+  const slots = [];
+  const make = (plan, analyze, settledMask, detector = null) => {
+    const winCanvas = new OffscreenCanvas(inpainter.SIZE, inpainter.SIZE);
+    const overlay = new OffscreenCanvas(inpainter.SIZE, inpainter.SIZE);
+    // Band of pixels just outside the mask: while it is unchanged since the
+    // last model run, that fill is still valid and the model is skipped.
+    const band = inpainter.bandIndices(settledMask, dilate(settledMask, Math.max(6, Math.round(8 * plan.m))));
+    slots.push({
+      plan, analyze, detector, band,
+      winCtx: winCanvas.getContext('2d', { willReadFrequently: true }),
+      overlay, overlayCtx: overlay.getContext('2d'),
+      ref: null, reuseAge: 0, ring: [],
+    });
+  };
+  if (badge) {
+    const detector = await createDetector(width, height);
+    make(detector.plan, (rgba, opts) => detector.analyze(rgba, opts), detector.maskSettled, detector);
+  }
+  for (const r of areas) {
+    const a = planArea(r, width, height);
+    if (!a) continue;
+    const verdict = { state: 'settled', mask: a.mask };
+    make(a, () => verdict, a.mask);
+  }
+  return slots;
 }
 
 /** Decide how audio gets into the output. Returns null for "no audio". */
